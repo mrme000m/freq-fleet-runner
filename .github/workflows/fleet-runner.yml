@@ -1,0 +1,81 @@
+name: Freqtrade Fleet Ubuntu Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_minutes:
+        description: "Minutes to keep the runner alive (max 360)"
+        required: true
+        default: "240"
+
+permissions:
+  contents: read
+
+jobs:
+  fleet-runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install and configure SSH server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server curl jq
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+          sudo systemctl status ssh --no-pager
+
+      - name: Create runner user and install SSH key
+        run: |
+          sudo useradd -m -s /bin/bash runner || true
+          echo "runner:${{ secrets.SSH_PASSWORD }}" | sudo chpasswd
+          sudo usermod -aG sudo runner
+          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner
+          sudo mkdir -p /home/runner/.ssh
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" | sudo tee /home/runner/.ssh/authorized_keys >/dev/null
+          sudo chown -R runner:runner /home/runner/.ssh
+          sudo chmod 700 /home/runner/.ssh
+          sudo chmod 600 /home/runner/.ssh/authorized_keys
+          echo "runner user ready"
+
+      - name: Install cloudflared
+        run: |
+          cd /tmp
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+          sudo dpkg -i cloudflared.deb || sudo apt-get install -f -y
+          cloudflared --version
+
+      - name: Start Cloudflare tunnel (SSH + REST API ingress)
+        run: |
+          sudo mkdir -p /root/.cloudflared
+          echo '${{ secrets.TUNNEL_CREDENTIALS }}' | sudo tee /root/.cloudflared/58052fa6-f501-4ba6-aabe-9167ea3b8086.json >/dev/null
+          sudo chmod 600 /root/.cloudflared/58052fa6-f501-4ba6-aabe-9167ea3b8086.json
+          sudo tee /root/.cloudflared/config.yml >/dev/null <<'EOF'
+          tunnel: 58052fa6-f501-4ba6-aabe-9167ea3b8086
+          credentials-file: /root/.cloudflared/58052fa6-f501-4ba6-aabe-9167ea3b8086.json
+          ingress:
+            - hostname: freq-fleet.00m.indevs.in
+              service: ssh://localhost:22
+            - hostname: freq-fleet-api.00m.indevs.in
+              service: http://localhost:8080
+            - service: http_status:404
+          EOF
+          sudo nohup cloudflared tunnel --no-autoupdate --config /root/.cloudflared/config.yml run >/tmp/cloudflared.log 2>&1 &
+          sleep 15
+          echo "---- cloudflared log ----"
+          tail -n 30 /tmp/cloudflared.log
+          echo "tunnel start requested"
+
+      - name: Keep alive
+        run: |
+          set -uo pipefail
+          TIMEOUT=${{ github.event.inputs.timeout_minutes }}
+          END=$((SECONDS + TIMEOUT * 60))
+          echo "Keeping runner alive for ${TIMEOUT} minutes"
+          echo "SSH:  ssh runner@freq-fleet.00m.indevs.in  (cloudflared access ssh proxy)"
+          echo "REST: https://freq-fleet-api.00m.indevs.in"
+          while [[ $SECONDS -lt $END ]]; do
+            sleep 5
+          done
+          echo "timeout reached"
