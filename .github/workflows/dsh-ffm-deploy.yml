@@ -168,7 +168,7 @@ jobs:
             [ -n "$PROXY_CMD" ] && echo "    ProxyCommand $PROXY_CMD"
           } > ~/.ssh/grid_config
           chmod 600 ~/.ssh/grid_config
-          echo "SSH_CMD=ssh -F ~/.ssh/grid_config grid-ffm" >> "$GITHUB_ENV"
+          echo "SSH_CMD=ssh -F $HOME/.ssh/grid_config grid-ffm" >> "$GITHUB_ENV"
 
       - name: Log the VM into GHCR (idempotent)
         if: env.TRANSPORT == 'ghcr'
