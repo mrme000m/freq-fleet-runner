@@ -68,14 +68,21 @@ function formPin(body) {
   return ''
 }
 
-export default {
-  name: 'dsh-pin-gate',
-  apply(ctx) {
-    if (!PIN) return
+export const name = 'dsh-pin-gate'
 
-    const webServer = ctx.get('webServer')
-    const connection = ctx.get('connection')
-    if (webServer === undefined || connection === undefined) return
+export function apply(ctx) {
+  if (!PIN) {
+    console.log('dsh-pin-gate: FFM_PIN not set — gate disabled')
+    return
+  }
+
+  ctx.inject(['webServer'], (webCtx) => {
+    const webServer = webCtx.get('webServer')
+    const connection = webCtx.get('connection')
+    if (webServer === undefined || connection === undefined) {
+      console.log('dsh-pin-gate: webServer/connection unavailable — gate disabled')
+      return () => {}
+    }
 
     const handler = async (req, res) => {
       const addr = (req.socket && req.socket.remoteAddress) || 'unknown'
@@ -124,6 +131,7 @@ export default {
       res.end()
     }
 
-    ctx.effect(() => webServer.register({ kind: 'prefix', path: '/pin', handler }))
-  }
+    webCtx.effect(() => webServer.register({ kind: 'prefix', path: '/pin', handler }))
+    console.log('dsh-pin-gate: /pin route registered')
+  }, 'dsh-pin-gate: webServer')
 }
