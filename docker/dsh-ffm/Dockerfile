@@ -94,7 +94,9 @@ RUN set -eux; \
         python3 /tmp/pnpm_allowbuilds.py /opt/dsh-home/profiles/web /tmp/plugin-add.log; \
         DSH_HOME=/opt/dsh-home dsh plugin --profile web add /opt/ffm-plugin; \
     fi; \
-    test -f /opt/dsh-home/profiles/web/node_modules/freqtrade-fleet-manager/lib/index.js
+    test -f /opt/dsh-home/profiles/web/node_modules/freqtrade-fleet-manager/lib/index.js; \
+    ln -sfn /opt/ffm-plugin /opt/dsh-home/profiles/web/node_modules/freqtrade-fleet-manager; \
+    test "$(readlink /opt/dsh-home/profiles/web/node_modules/freqtrade-fleet-manager)" = "/opt/ffm-plugin"
 
 # ── FFM payloads (cheap COPYs — always LAST) ───────────────────────────────
 # All preset payloads land in the SEED home /opt/dsh-home; the entrypoint

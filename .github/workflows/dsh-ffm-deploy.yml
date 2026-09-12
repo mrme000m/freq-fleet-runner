@@ -242,9 +242,25 @@ jobs:
           open(p, "w").write(yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False))
           print("ingress added:", host, "->", service)
           PY'
-          $SSH_CMD 'sudo pkill -f "cloudflared tunnel" || true; sleep 2; sudo nohup cloudflared tunnel --no-autoupdate --config /root/.cloudflared/config.yml run >/tmp/cloudflared.log 2>&1 & sleep 10; tail -n 5 /tmp/cloudflared.log'
 
-          # 2. DNS CNAME dsh-ffm.00m.indevs.in → <tunnel-id>.cfargotunnel.com
+          # 2. Trigger a DETACHED cloudflared restart. cloudflared carries
+          #    this very SSH connection, so killing it in-band kills the
+          #    session (exit 255). Dispatch a setsid'd helper that waits 2s
+          #    (letting SSH return cleanly), then pkills; the fleet-runner
+          #    cloudflared-loop (auto-restart) picks up the new config and
+          #    reconnects within ~5-10s.
+          $SSH_CMD "sudo setsid nohup sh -c 'sleep 2; pkill -f \"cloudflared tunnel\" || true' >/tmp/cf-restart.log 2>&1 &" || true
+
+          # 3. Wait for the tunnel to come back before relying on SSH again.
+          for i in $(seq 1 30); do
+            if $SSH_CMD 'true' >/dev/null 2>&1; then
+              echo "tunnel reconnected after ~$((i * 5))s"
+              break
+            fi
+            sleep 5
+          done
+
+          # 4. DNS CNAME dsh-ffm.00m.indevs.in → <tunnel-id>.cfargotunnel.com
           if [ -z "${{ secrets.CF_API_TOKEN }}" ] || [ -z "${{ secrets.CF_ACCOUNT_ID }}" ]; then
             echo "::warning::CF_API_TOKEN / CF_ACCOUNT_ID not set — DNS CNAME skipped (deploy continues)"
             exit 0

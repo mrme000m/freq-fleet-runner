@@ -119,6 +119,13 @@ if [ "$BAKED_REV" != "$SEEDED_REV" ]; then
   cp -a "$SEED_HOME/.agent-presets/ffm" "$DSH_HOME/.last-seed/ffm"
 fi
 
+# The pnpm-installed plugin link is RELATIVE (../../../../ffm-plugin): it
+# resolves fine in the baked seed home (/opt/dsh-home/...) but breaks when
+# the seed is copied to the runtime home (/data/dsh/... → /data/ffm-plugin,
+# which does not exist). Force the absolute target each boot — idempotent,
+# and /opt/ffm-plugin is baked into the image (never a volume).
+ln -sfn /opt/ffm-plugin "$DSH_HOME/profiles/web/node_modules/freqtrade-fleet-manager" 2>/dev/null || true
+
 # settings.yaml — derived from the baked template each boot. Two sources of
 # truth: (a) the baked TEMPLATE (image-owned) and (b) operator edits to the
 # rendered file. When the template's sha changes (image updated the model
