@@ -1,0 +1,29 @@
+# dsh-ffm image build context
+#
+# The image only needs: docker/dsh-ffm/ (the payloads + helpers) and
+# freqtrade-fleet-manager/ (the plugin — package.json, cordis.patch.yml,
+# README, LICENSE, lib/). Everything else is noise.
+.git
+**/.git
+freqtrade/
+.vibe/
+.github/workflows/*.yml
+.github/workflows/*.yaml
+
+# node/yarn/pnpm + python hygiene (never ship a dev tree into the context)
+**/node_modules
+**/.pnpm-store
+**/dist
+**/*.tsbuildinfo
+npm-debug.log*
+
+# secrets & local scratch — keep out of the context and image history
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*id_rsa*
+**/.secrets
+**/known_hosts
+*.log
+.DS_Store

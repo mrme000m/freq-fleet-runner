@@ -1,0 +1,103 @@
+# Managed template — rendered into the runtime DSH home by the image's
+# entrypoint (docker/dsh-ffm/entrypoint.sh): the @CF_ACCOUNT_ID@ placeholder
+# is substituted from the runtime environment (CF_ACCOUNT_ID, falling back to
+# CLOUDFLARE_ACCOUNT_ID — the env name the dsh Cloudflare provider stack
+# expects). NO secrets live here: the API key is read at request time from the
+# apiKeyEnv variable (CLOUDFLARE_AI_TOKEN, bridged from CLOUDFLARE_API_KEY by
+# the entrypoint when unset; NVIDIA/OPENROUTER/MISTRAL_API_KEY sourced from
+# the vault env via the entrypoint's BW_VAULT_ONLY=cf,llm vault_loader run —
+# absent keys simply fail at request time, the provider entries themselves
+# are harmless).
+# CF Workers AI is the default LLM; nvidia/openrouter/mistral are the worker
+# fallback chain (CF → Nvidia → OpenRouter, plus Mistral).
+agent-default-model:
+  provider: cloudflare-workers-ai
+  model: "@cf/zai-org/glm-5.3"
+agent-presets:
+  default: ffm
+locale:
+  preference: en
+permission:
+  defaultPreset: danger-full-access
+llm-pi-ai:
+  providers:
+    cloudflare-workers-ai:
+      displayName: cloudflare-workers-ai
+      apiKeyEnv: CLOUDFLARE_AI_TOKEN
+      api: openai-completions
+      baseURL: https://api.cloudflare.com/client/v4/accounts/@CF_ACCOUNT_ID@/ai/v1
+      models:
+        - id: "@cf/zai-org/glm-5.2"
+          name: "CF Workers AI / GLM-5.2"
+          contextWindow: 262144
+          maxTokens: 16384
+        - id: "@cf/deepseek-ai/deepseek-v4-flash-0731"
+          name: "CF Workers AI / DeepSeek V4 Flash 0731"
+          contextWindow: 1310720
+          maxTokens: 16384
+        - id: "@cf/deepseek-ai/deepseek-v4-pro-0813"
+          name: "CF Workers AI / DeepSeek V4 Pro 0813"
+          contextWindow: 1048576
+          maxTokens: 16384
+        - id: "@cf/qwen/qwen3.8-27b"
+          name: "CF Workers AI / Qwen3.8 27B"
+          contextWindow: 262144
+          maxTokens: 16384
+        - id: "@cf/moonshotai/kimi-k2.6"
+          name: "CF Workers AI / Kimi K2.6"
+          contextWindow: 262144
+          maxTokens: 16384
+        - id: "@cf/moonshotai/kimi-k2.7-code"
+          name: "CF Workers AI / Kimi K2.7 Code"
+          contextWindow: 262144
+          maxTokens: 16384
+        - id: "@cf/zai-org/glm-5.3"
+          name: "CF Workers AI / GLM-5.3"
+          contextWindow: 1310720
+          maxTokens: 16384
+        - id: "@cf/zai-org/glm-5.3-flash"
+          name: "CF Workers AI / GLM-5.3 Flash"
+          contextWindow: 1310720
+          maxTokens: 16384
+    nvidia:
+      displayName: nvidia
+      apiKeyEnv: NVIDIA_API_KEY
+      api: openai-completions
+      baseURL: https://integrate.api.nvidia.com/v1
+      models:
+        - id: meta/llama-3.3-70b-instruct
+          name: "NVIDIA / Llama 3.3 70B Instruct"
+          contextWindow: 131072
+          maxTokens: 32768
+    openrouter:
+      displayName: openrouter
+      apiKeyEnv: OPENROUTER_API_KEY
+      api: openai-completions
+      baseURL: https://openrouter.ai/api/v1
+      models:
+        - id: arcee-ai/trinity-large-preview:free
+          name: "OpenRouter / Trinity Large Preview (free)"
+          contextWindow: 131072
+          maxTokens: 32768
+        - id: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+          name: "NVIDIA / Nemotron 3 Nano Omni (free)"
+          contextWindow: 131072
+          maxTokens: 32768
+        - id: poolside/laguna-s-2.1:free
+          name: "Poolside / Laguna S 2.1 (free)"
+          contextWindow: 131072
+          maxTokens: 32768
+        - id: nvidia/nemotron-3.5-lightning:free
+          name: "NVIDIA / Nemotron 3.5 Lightning (free)"
+          contextWindow: 131072
+          maxTokens: 32768
+    mistral:
+      displayName: mistral
+      apiKeyEnv: MISTRAL_API_KEY
+      api: openai-completions
+      baseURL: https://api.mistral.ai/v1
+      models:
+        - id: mistral-large-latest
+          name: "Mistral / Large Latest"
+          contextWindow: 131072
+          maxTokens: 32768

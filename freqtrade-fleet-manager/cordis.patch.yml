@@ -1,0 +1,26 @@
+# freqtrade-fleet-manager bundle patch.
+#
+# Installing this package through the official CLI —
+#
+#   dsh plugin --profile web add freqtrade-fleet-manager
+#   (or: dsh plugin --profile web add ./path/to/freqtrade-fleet-manager)
+#
+# — reconciles `dsh.profile.bundles` against installed packages and, seeing the
+# `dsh.bundle.patch` declaration in package.json, appends this package to the
+# profile's bundle stack. The profile boot then merges this patch: one insert
+# of the host row.
+#
+# The single row carries the whole feature:
+#   - node half (exports "."): the Freqtrade Fleet Manager host entry — the
+#     instance registry, the 54 model-facing `ft_*` tools (registered into the
+#     host `tools` registry, so every session sees them), and the `/freqtrade`
+#     JSON API served on the host web server for the dashboard.
+#   - browser half (exports "./client", declared via `dsh.client`): the
+#     Settings → "Freqtrade Fleet" section, which fetches `/freqtrade/api/fleet`
+#     and renders instance list + live `/ping` health.
+#
+# If a profile already carries a manual mount line for this plugin, remove it
+# before switching to the bundle channel to avoid double-mounting.
+- insert:
+    - id: freqtrade-fleet-manager
+      name: 'freqtrade-fleet-manager'

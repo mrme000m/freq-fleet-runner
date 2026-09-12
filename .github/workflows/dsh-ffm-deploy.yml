@@ -1,0 +1,285 @@
+name: dsh-ffm deploy (Freqtrade Fleet Manager agent)
+
+# Deploys the standalone dsh-ffm container (dsh web + the freqtrade-fleet-manager
+# plugin + the `ffm` agent preset — a clone of the Creator Mode `cordis`
+# preset) to the FREQ-FLEET EPHEMERAL RUNNER VM, published over the Cloudflare
+# tunnel at https://dsh-ffm.00m.indevs.in.
+#
+# HOST CONTEXT — the `freq-fleet` host is an EPHEMERAL GitHub Actions runner
+# VM brought up on demand by .github/workflows/fleet-runner.yml (ssh + the
+# freqtrade REST API on :8080, locally-managed cloudflared tunnel). Each spin
+# re-creates the VM + tunnel from that workflow, so every dsh-ffm deploy here
+# runs against the CURRENT live runner: SSH in, stream the image, launch the
+# container, add the dsh-ffm ingress to the VM's /root/.cloudflared/config.yml,
+# create the DNS CNAME, health-gate.
+#
+# Transport: ssh-stream (default) — docker save | gzip over SSH | docker load
+# on the VM; no host-side registry auth (the VM is fresh every spin). ghcr is
+# an alternative (layer-diffed pull) but needs GHCR_PULL_TOKEN + a host login.
+#
+# SSH reaches the runner THROUGH the tunnel: cloudflared access ssh --hostname
+# <SSH_HOST>, authenticating with the account cert.pem (secret
+# CF_ACCESS_CERT_PEM → ~/.cloudflared/cert.pem). SSH config comes from repo
+# secrets:
+#   SSH_HOST           freq-fleet.00m.indevs.in
+#   SSH_USER           runner (passwordless sudo + docker)
+#   SSH_PORT           22
+#   SSH_PRIVATE_KEY    the runner's ssh private key (matches SSH_PUBLIC_KEY in
+#                      fleet-runner.yml)
+#   SSH_PROXY          set (non-empty) → cloudflared access path
+#   CF_ACCESS_CERT_PEM the account-level cert.pem used by cloudflared access
+#
+# The dsh-ffm env file (repo secrets — the self-hosted vault machine creds the
+# container's vault_loader uses to resolve the Cloudflare + LLM items,
+# BW_VAULT_ONLY=cf,llm):
+#   BW_URL           Vaultwarden server URL
+#   BW_USERNAME      display-only vault account label
+#   BW_PASSWORD      vault master password
+#   BW_CLIENTID      machine-auth API key client id
+#   BW_CLIENTSECRET  machine-auth API key client secret
+#   CF_TUNNEL_TOKEN  NOT used — the runner tunnel is locally-managed on the VM
+#                    (a connector sidecar would conflict; leave empty)
+#
+# Cloudflare (OPTIONAL — gated on CF_API_TOKEN/CF_ACCOUNT_ID; absent →
+# ::warning:: + skip, the deploy never fails on it):
+#   CF_API_TOKEN     API token with DNS edit on the 00m.indevs.in zone
+#   CF_ACCOUNT_ID    the Cloudflare account id
+#   CF_TUNNEL_ID     the runner tunnel id (fleet-runner.yml: 58052fa6-…)
+# Steps: (a) SSH → edit the VM's /root/.cloudflared/config.yml ingress
+# (dsh-ffm.00m.indevs.in → http://127.0.0.1:3083 — the container's host
+# published port; cloudflared runs as a HOST process, not in docker, so the
+# docker DNS name is NOT resolvable) + restart cloudflared; (b) DNS CNAME
+# dsh-ffm.00m.indevs.in → <tunnel-id>.cfargotunnel.com (proxied). Every other
+# ingress rule is preserved verbatim.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/dsh-ffm/**'
+      - 'freqtrade-fleet-manager/**'
+      - '.github/workflows/dsh-ffm-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      transport:
+        description: 'How the image reaches the VM'
+        type: choice
+        default: 'ssh-stream'
+        options:
+          - ghcr
+          - ssh-stream
+
+concurrency:
+  group: dsh-ffm-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/dsh-ffm
+  NAME: dsh-ffm
+  REMOTE_DIR: /opt/dsh-ffm
+  TUNNEL_ID: 58052fa6-f501-4ba6-aabe-9167ea3b8086
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the freqtrade-fleet-manager plugin (latest lib/)
+        run: |
+          cd freqtrade-fleet-manager
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm run build
+          test -f lib/index.js && test -f lib/client.js
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/dsh-ffm/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:main
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,mode=max,ref=${{ env.IMAGE }}:buildcache
+          # The commit SHA stamps /opt/dsh-home/.baked-rev in the image: the
+          # entrypoint uses it to detect image revisions and refresh the
+          # seeded ffm preset in the ffm-dsh volume (operator-edited preset
+          # files are preserved, not clobbered).
+          build-args: |
+            FFM_PRESET_REV=${{ github.sha }}
+
+      - name: Resolve transport
+        run: |
+          TRANSPORT="${{ inputs.transport || 'ssh-stream' }}"
+          if [ "$TRANSPORT" = "ghcr" ] && [ -z "${{ secrets.GHCR_PULL_TOKEN }}" ]; then
+            echo "::warning::GHCR_PULL_TOKEN not set — falling back to SSH streaming"
+            TRANSPORT=ssh-stream
+          fi
+          echo "TRANSPORT=$TRANSPORT" >> "$GITHUB_ENV"
+
+      - name: Set up SSH (cloudflared access via cert.pem)
+        run: |
+          mkdir -p ~/.ssh ~/.cloudflared
+          install -m 600 /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          if [ -n "${{ secrets.SSH_PROXY }}" ]; then
+            echo "::notice::SSH_PROXY set — installing cloudflared + account cert.pem"
+            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+            sudo dpkg -i /tmp/cloudflared.deb
+            install -m 600 /dev/null ~/.cloudflared/cert.pem
+            printf '%s\n' "${{ secrets.CF_ACCESS_CERT_PEM }}" > ~/.cloudflared/cert.pem
+            ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+            echo "SSH_CMD=ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} -o BatchMode=yes -o ProxyCommand='cloudflared access ssh --hostname ${{ secrets.SSH_HOST }}' ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" >> "$GITHUB_ENV"
+          else
+            ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+            echo "SSH_CMD=ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} -o BatchMode=yes ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log the VM into GHCR (idempotent)
+        if: env.TRANSPORT == 'ghcr'
+        run: |
+          printf '%s' '${{ secrets.GHCR_PULL_TOKEN }}' \
+            | $SSH_CMD 'sudo docker login ghcr.io -u ${{ github.actor }} --password-stdin >/dev/null'
+
+      - name: Pull the image on the VM
+        if: env.TRANSPORT == 'ghcr'
+        run: |
+          # Layer-diffed pull: unchanged layers are already present from the
+          # previous deploy. NOTE: ssh appends extra argv to the remote
+          # command STRING, so the image ref must be interpolated into the
+          # quoted command — not passed as a trailing argument.
+          IMAGE_REF="${{ env.IMAGE }}:${{ github.sha }}"
+          $SSH_CMD "sudo docker pull '$IMAGE_REF'"
+
+      - name: Stream the image to the VM and load it (ssh-stream default)
+        if: env.TRANSPORT == 'ssh-stream'
+        run: |
+          docker pull "${{ env.IMAGE }}:${{ github.sha }}"
+          docker save "${{ env.IMAGE }}:${{ github.sha }}" \
+            | gzip -1 | $SSH_CMD 'gzip -d | sudo docker load'
+
+      - name: Write the dsh-ffm env file on the VM
+        run: |
+          $SSH_CMD "sudo mkdir -p $REMOTE_DIR && sudo chown ${{ secrets.SSH_USER }} $REMOTE_DIR && chmod 700 $REMOTE_DIR"
+          $SSH_CMD "umask 177 && cat > $REMOTE_DIR/.env" <<'ENVEOF'
+          BW_URL=${{ secrets.BW_URL }}
+          BW_USERNAME=${{ secrets.BW_USERNAME }}
+          BW_PASSWORD=${{ secrets.BW_PASSWORD }}
+          BW_CLIENTID=${{ secrets.BW_CLIENTID }}
+          BW_CLIENTSECRET=${{ secrets.BW_CLIENTSECRET }}
+          CF_TUNNEL_TOKEN=
+          ENVEOF
+          $SSH_CMD "chmod 600 $REMOTE_DIR/.env && grep -c '^[A-Z]' $REMOTE_DIR/.env"
+
+      - name: Ship the runner script and start the container
+        run: |
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            -o ProxyCommand='cloudflared access ssh --hostname ${{ secrets.SSH_HOST }}' \
+            docker/dsh-ffm/ffm-run.sh \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:$REMOTE_DIR/ffm-run.sh"
+          $SSH_CMD "chmod +x $REMOTE_DIR/ffm-run.sh"
+          $SSH_CMD "IMAGE='${{ env.IMAGE }}:${{ github.sha }}' NAME='$NAME' bash $REMOTE_DIR/ffm-run.sh"
+
+      # ── dsh-ffm.00m.indevs.in — VM-local tunnel ingress + DNS CNAME ─────
+      # The runner tunnel is LOCALLY managed (config on the VM), so the
+      # ingress is edited there (never via the CF API remote-config), then
+      # cloudflared is restarted the same way fleet-runner.yml starts it.
+      # cloudflared is a HOST process → the service target is the container's
+      # host-published port http://127.0.0.1:3083 (docker DNS is not visible
+      # to the host process). Non-fatal on CF API/DNS failures.
+      - name: Add dsh-ffm ingress on the VM + DNS CNAME
+        run: |
+          set -uo pipefail
+
+          # 1. edit /root/.cloudflared/config.yml on the VM (add the rule
+          #    before the catch-all, preserve everything else) + restart
+          $SSH_CMD 'sudo python3 - <<PY
+          import yaml, sys
+          p = "/root/.cloudflared/config.yml"
+          cfg = yaml.safe_load(open(p))
+          host, service = "dsh-ffm.00m.indevs.in", "http://127.0.0.1:3083"
+          ing = cfg.get("ingress", [])
+          if any(r.get("hostname") == host for r in ing):
+              print("ingress already present")
+              sys.exit(0)
+          # insert before the first hostname-less catch-all rule
+          idx = next((i for i, r in enumerate(ing) if not r.get("hostname")), len(ing))
+          ing.insert(idx, {"hostname": host, "service": service})
+          open(p, "w").write(yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False))
+          print("ingress added:", host, "->", service)
+          PY'
+          $SSH_CMD 'sudo pkill -f "cloudflared tunnel" || true; sleep 2; sudo nohup cloudflared tunnel --no-autoupdate --config /root/.cloudflared/config.yml run >/tmp/cloudflared.log 2>&1 & sleep 10; tail -n 5 /tmp/cloudflared.log'
+
+          # 2. DNS CNAME dsh-ffm.00m.indevs.in → <tunnel-id>.cfargotunnel.com
+          if [ -z "${{ secrets.CF_API_TOKEN }}" ] || [ -z "${{ secrets.CF_ACCOUNT_ID }}" ]; then
+            echo "::warning::CF_API_TOKEN / CF_ACCOUNT_ID not set — DNS CNAME skipped (deploy continues)"
+            exit 0
+          fi
+          CF_API="https://api.cloudflare.com/client/v4"
+          AUTH="Authorization: Bearer ${{ secrets.CF_API_TOKEN }}"
+          HOST="dsh-ffm.00m.indevs.in"
+          TARGET="$TUNNEL_ID.cfargotunnel.com"
+          ZONE_JSON="$(curl -fsS -m 20 -H "$AUTH" "$CF_API/zones?name=00m.indevs.in" || true)"
+          ZONE_ID="$(echo "$ZONE_JSON" | jq -r '.result[0].id // empty' 2>/dev/null || true)"
+          if [ -n "$ZONE_ID" ]; then
+            REC_JSON="$(curl -fsS -m 20 -H "$AUTH" "$CF_API/zones/$ZONE_ID/dns_records?name=$HOST" || true)"
+            REC="$(echo "$REC_JSON" | jq -c '.result[0] // empty' 2>/dev/null || true)"
+            if [ -z "$REC" ]; then
+              CREATE="$(curl -fsS -m 20 -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                -d "{\"type\":\"CNAME\",\"name\":\"$HOST\",\"content\":\"$TARGET\",\"proxied\":true}" \
+                "$CF_API/zones/$ZONE_ID/dns_records" || true)"
+              echo "$CREATE" | jq -e '.success' >/dev/null 2>&1 \
+                && echo "DNS CNAME created: $HOST → $TARGET" \
+                || echo "::warning::DNS CNAME create failed: $(echo "$CREATE" | jq -c '.errors' 2>/dev/null || echo '?')"
+            elif [ "$(echo "$REC" | jq -r '.content')" = "$TARGET" ]; then
+              echo "DNS CNAME already correct: $HOST → $TARGET"
+            else
+              REC_ID="$(echo "$REC" | jq -r '.id')"
+              UPDATE="$(curl -fsS -m 20 -X PUT -H "$AUTH" -H "Content-Type: application/json" \
+                -d "{\"type\":\"CNAME\",\"name\":\"$HOST\",\"content\":\"$TARGET\",\"proxied\":true}" \
+                "$CF_API/zones/$ZONE_ID/dns_records/$REC_ID" || true)"
+              echo "$UPDATE" | jq -e '.success' >/dev/null 2>&1 \
+                && echo "DNS record updated: $HOST → $TARGET" \
+                || echo "::warning::DNS CNAME update failed: $(echo "$UPDATE" | jq -c '.errors' 2>/dev/null || echo '?')"
+            fi
+          else
+            echo "::warning::zone lookup failed for 00m.indevs.in — DNS CNAME skipped"
+          fi
+
+      - name: Health gate (vault load + dsh home seed + settings render)
+        run: |
+          # dsh web serves 127.0.0.1:3083 on the VM (the publish maps to the
+          # in-container :3081). First boot may take ~30-90s.
+          for i in $(seq 1 24); do
+            if $SSH_CMD 'curl -fs -m 5 http://127.0.0.1:3083/' >/dev/null 2>&1; then
+              echo "healthy after ~$((i * 15))s"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::dsh-ffm never became healthy"
+          $SSH_CMD 'sudo docker logs --tail 60 '"$NAME"' || true'
+          exit 1
+
+      - name: Deployment report
+        if: always()
+        run: |
+          $SSH_CMD 'sudo docker ps --filter name='"$NAME"' --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"; echo; sudo docker images --format "{{.Repository}}:{{.Tag}} {{.Size}}" | head -5; echo; sudo docker logs --tail 40 '"$NAME"' 2>&1 | grep -iE "dsh|ffm|preset|vault|seed|freqtrade|plugin" || true'

@@ -1,0 +1,11 @@
+name: Freqtrade Fleet Creator
+description: >
+  A clone of the Creator Mode (cordis) preset for the Freqtrade Fleet Manager
+  (dsh-ffm): the full standard coding agent PLUS the self-referential Cordis
+  toolset (runtime inspection, plugin experiments, preset authoring) AND the
+  freqtrade-fleet-manager host engine — the ft_* tools for deploying,
+  managing, and configuring Freqtrade instances (local and SSH), the
+  /freqtrade dashboard API, and the fleet registry. Use this preset to
+  operate the Freqtrade fleet and to author/experiment with dsh plugins and
+  agent presets.
+order: 10
