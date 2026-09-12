@@ -2,7 +2,7 @@
 
 Deploy, manage, and configure multiple [Freqtrade](https://github.com/freqtrade/freqtrade) instances — local (bare metal / Docker / systemd) and remote (SSH) — from a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) agent, in one installable plugin package.
 
-- **Host engine**: the instance registry (persisted to `$DSH_HOME/.freqtrade-instances.json`), a **54-tool** `ft_*` control surface, credential-backed secrets, config validation/generation, local + SSH deploy/sync/bootstrap, and the `/freqtrade` JSON API for the dashboard.
+- **Host engine**: the instance registry (persisted to `$DSH_HOME/.freqtrade-instances.json`), a **56-tool** `ft_*` control surface, credential-backed secrets, config validation/generation, local + SSH deploy/sync/bootstrap, a one-call `ft_fleet_overview` health sweep, and the `/freqtrade` JSON API for the dashboard.
 - **Model-facing tools**: registered into the host `tools` registry from the bundle row, so every session (any preset) sees them — no preset setup required.
 - **Web UI**: a Settings → **Freqtrade Fleet** section listing registered instances with live unauthenticated `/ping` health and latency.
 
@@ -38,14 +38,15 @@ One package, two mounted surfaces:
 
 | Surface | Mount | Content |
 | --- | --- | --- |
-| `exports "."` | bundle row `freqtrade-fleet-manager` (from `cordis.patch.yml`) | host engine: registry + 54 tools + `/freqtrade` API |
+| `exports "."` | bundle row `freqtrade-fleet-manager` (from `cordis.patch.yml`) | host engine: registry + 56 tools + `/freqtrade` API |
 | `exports "./client"` (`dsh.client`) | browser roster (scanned from mounted entries) | Settings → Freqtrade Fleet dashboard |
 
 No agent preset is needed: the tools register into the host `tools` registry from the host-plane bundle row, so they are available to every session.
 
 ## Tool catalog
 
-- **Registry**: `ft_instances_add` / `ft_instances_list` / `ft_instances_get` / `ft_instances_remove`
+- **Registry**: `ft_instances_add` / `ft_instances_update` / `ft_instances_list` / `ft_instances_get` / `ft_instances_remove`
+- **Fleet sweep**: `ft_fleet_overview` (parallel ping + open trades + PnL for every instance)
 - **Generic passthrough**: `ft_api` (any `/api/v1` endpoint, auto-JWT)
 - **Lifecycle**: `ft_start` `ft_stop` `ft_pause` `ft_stopbuy` `ft_reload_config`
 - **Telemetry**: `ft_ping` `ft_version` `ft_health` `ft_sysinfo` `ft_status` `ft_balance` `ft_profit` `ft_performance` `ft_whitelist` `ft_blacklist` `ft_locks` `ft_trades` `ft_show_config` `ft_logs`
@@ -75,7 +76,7 @@ pnpm run build      # lib/index.js (ESM host) + lib/client.js (browser closure f
 pnpm run verify     # build + npm pack --dry-run
 ```
 
-- `src/index.js` — host entry (registry, helpers, 54 tools, `/freqtrade` API).
+- `src/index.js` — host entry (registry, helpers, 56 tools, `/freqtrade` API).
 - `client/index.js` — browser half (Settings → Freqtrade Fleet).
 - `cordis.patch.yml` — the bundle row the profile boot merges.
 - `tsdown.config.mjs` — host ESM build (peers external) + browser CJS closure-factory build.

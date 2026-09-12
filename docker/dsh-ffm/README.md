@@ -33,7 +33,7 @@ http://localhost:3083.
 
 - **dsh**: npm `latest` **`0.1.5-rc.1`** — verified compatible with the
   `freqtrade-fleet-manager` plugin in this workspace: `dsh plugin --profile web
-  add` installs it cleanly, `apply()` registers all 54 tools, the web profile
+  add` installs it cleanly, `apply()` registers all 56 tools, the web profile
   serves, and every one of the 26 preset rows in the cloned cordis composition
   resolves against the profile modules. (The plugin's peerDeps table lists
   `0.1.0-rc.7 || 0.1.1-rc.2`, but `0.1.5-rc.1` works — verified live.)

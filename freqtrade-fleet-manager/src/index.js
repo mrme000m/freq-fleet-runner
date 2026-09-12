@@ -155,6 +155,25 @@ export function apply(ctx) {
       return { exitCode: r.exitCode, stdout: (r.stdout && r.stdout.text) || '', stderr: (r.stderr && r.stderr.text) || '' }
     }
 
+    // Bounded-concurrency map: run fn over items with at most `limit` in
+    // flight, preserving order in the result array.
+    async function mapLimit(items, limit, fn) {
+      const out = new Array(items.length)
+      let cursor = 0
+      const workers = []
+      const n = Math.max(1, Math.min(limit, items.length))
+      for (let w = 0; w < n; w++) {
+        workers.push((async () => {
+          while (cursor < items.length) {
+            const idx = cursor++
+            out[idx] = await fn(items[idx], idx)
+          }
+        })())
+      }
+      await Promise.all(workers)
+      return out
+    }
+
     async function curl(method, url, opts) {
       const parts = ['curl', '-sS', '-X', method, '--max-time', '40', '-w', "'\\n__FT_STATUS__%{http_code}'"]
       if (opts && opts.token) parts.push('-H', sq('Authorization: Bearer ' + opts.token))
@@ -591,6 +610,62 @@ export function apply(ctx) {
       return { ok: true, removed: name }
     })
 
+    reg('ft_instances_update', 'Update mutable fields of a registered instance in place (name is immutable — remove + re-add to rename). Rotates api_password in credentials when provided; returns the redacted instance and the list of changed fields.', {
+      name: nameParam.name,
+      base_url: { type: 'string', description: 'New REST API base URL, e.g. http://127.0.0.1:8080.' },
+      api_username: { type: 'string', description: 'New Freqtrade API username.' },
+      api_password: { type: 'string', description: 'Rotate the Freqtrade API password (stored in credentials; never echoed back).' },
+      host: { type: 'string', enum: ['local', 'ssh'], description: 'New host kind ("local" or "ssh").' },
+      ssh_target: { type: 'string', description: 'New ssh target user@host[:port] (host=ssh).' },
+      user_data: { type: 'string', description: 'New user_data dir (local path, or remote path when host=ssh).' },
+      strategy: { type: 'string', description: 'New strategy class name.' },
+      exchange: { type: 'string', description: 'New exchange name.' },
+      dry_run: { type: 'boolean', description: 'New dry-run flag. Set false only with explicit human confirmation.' }
+    }, async (args) => {
+      const inst = getInst(String(args.name))
+      const changed = []
+      if (args.base_url !== undefined) {
+        const v = String(args.base_url).trim()
+        if (!v) return { ok: false, error: 'base_url must be non-empty' }
+        inst.base_url = v
+        changed.push('base_url')
+      }
+      if (args.api_username !== undefined) { inst.username = String(args.api_username); changed.push('api_username') }
+      if (args.api_password !== undefined && String(args.api_password) !== '') {
+        const pw = String(args.api_password)
+        if (credentials !== undefined) {
+          try {
+            const ref = secretRefName(inst.name, 'API_PASSWORD')
+            await credentials.set(ref, pw)
+            inst.password_ref = ref
+            inst.password = ''
+          } catch (e) {
+            return { ok: false, error: 'failed to store rotated api_password in credentials: ' + ((e && e.message) || e) }
+          }
+        } else {
+          inst.password = pw
+          inst.password_ref = ''
+        }
+        changed.push('api_password')
+      }
+      if (args.host !== undefined) {
+        if (args.host !== 'local' && args.host !== 'ssh') return { ok: false, error: 'host must be "local" or "ssh"' }
+        inst.host = args.host
+        changed.push('host')
+      }
+      for (const f of ['ssh_target', 'user_data', 'strategy', 'exchange']) {
+        if (args[f] !== undefined && String(args[f]) !== '') { inst[f] = String(args[f]); changed.push(f) }
+      }
+      if (args.dry_run !== undefined) { inst.dry_run = args.dry_run !== false; changed.push('dry_run') }
+      if (changed.length === 0) return { ok: false, error: 'no fields to update' }
+      inst.updated_at = new Date().toISOString()
+      await saveRegistry()
+      let note = 'Verify connectivity with ft_ping.'
+      if (changed.indexOf('dry_run') >= 0 && inst.dry_run === false) note = 'NOTE: instance is now LIVE (dry_run=false).'
+      else if (changed.indexOf('host') >= 0 && inst.host === 'ssh' && !inst.ssh_target) note = 'NOTE: host=ssh but ssh_target is empty — deploy/sync/hyperopt-ssh will fail until it is set.'
+      return { ok: true, updated: changed, instance: redact(inst), note }
+    })
+
     // ---- secrets (v2) ----
     reg('ft_secret_set', 'Set/rotate a secret for an instance. Stored in the credentials service (ref FTMGR_<NAME>_<KIND>); the api_password is also used for REST login.', {
       name: nameParam.name,
@@ -681,6 +756,71 @@ export function apply(ctx) {
       const path = String(args.path)
       if (!path.startsWith('/')) return { ok: false, error: 'path must start with "/"' }
       return guard(async () => apiResult(await ftCall(String(args.name), method, path, args.body)))
+    })
+
+    // ---- fleet overview (one-call read-only sweep for the periodic audit) ----
+    reg('ft_fleet_overview', 'One-call read-only fleet sweep: ping every registered instance (up/down + latency, in parallel), then collect open-trade count and realized PnL per reachable instance. Use for the periodic health audit instead of N individual calls.', {
+      include_profit: { type: 'boolean', description: 'Also fetch /profit per reachable instance (default true; set false to save calls).' },
+      ping_timeout_ms: { type: 'integer', description: 'Per-instance ping timeout in ms (default 6000, max 20000).' }
+    }, async (args) => {
+      const list = [...instances.values()]
+      if (list.length === 0) return { ok: true, count: 0, up: 0, down: 0, open_trades_total: 0, instances: [] }
+      const pto = Math.min(20000, Math.max(1000, args.ping_timeout_ms !== undefined ? (parseInt(args.ping_timeout_ms, 10) || 6000) : 6000))
+      const pings = await mapLimit(list, 4, async (it) => {
+        const row = {
+          name: it.name, base_url: it.base_url, host: it.host, strategy: it.strategy || '', exchange: it.exchange || '',
+          dry_run: it.dry_run !== false, up: null, latency_ms: null, ping_error: null
+        }
+        if (!it.base_url) { row.up = false; row.ping_error = 'no base_url'; return row }
+        const started = Date.now()
+        try {
+          const r = await runCmd('curl -sS -o /dev/null -w ' + sq('%{http_code}') + ' --max-time ' + Math.max(1, Math.floor(pto / 1000)) + ' ' + sq(String(it.base_url).replace(/\/+$/, '') + '/api/v1/ping'), pto + 3000)
+          row.latency_ms = Date.now() - started
+          const code = String((r && r.stdout) || '').trim()
+          row.up = r.exitCode === 0 && /^2/.test(code)
+          if (!row.up) row.ping_error = r.exitCode === 0 ? 'HTTP ' + code : (((r && r.stderr) || '').slice(0, 200) || 'curl exit ' + r.exitCode)
+        } catch (e) {
+          row.up = false
+          row.ping_error = String((e && e.message) || e)
+        }
+        return row
+      })
+      const upRows = pings.filter((p) => p.up === true)
+      const wantProfit = args.include_profit !== false
+      await mapLimit(upRows, 3, async (row) => {
+        try {
+          const st = await ftCall(row.name, 'GET', '/status')
+          const sd = st && st.data && typeof st.data === 'object' ? st.data : {}
+          const trades = Array.isArray(sd) ? sd : (Array.isArray(sd.trades) ? sd.trades : [])
+          row.trading = typeof sd.trading === 'boolean' ? sd.trading : null
+          row.open_trades = trades.length
+          row.open_profit_ratio = trades.reduce((s, t) => s + (t && typeof t.profit_ratio === 'number' ? t.profit_ratio : 0), 0)
+        } catch (e) {
+          row.status_error = String((e && e.message) || e)
+        }
+        if (wantProfit) {
+          try {
+            const pr = await ftCall(row.name, 'GET', '/profit')
+            const pd = pr && pr.data && typeof pr.data === 'object' ? pr.data : {}
+            row.realized = {
+              profit_ratio: typeof pd.profit_ratio === 'number' ? pd.profit_ratio : null,
+              profit_abs: typeof pd.profit_abs === 'number' ? pd.profit_abs : null,
+              profit_currency: pd.profit_currency || null,
+              trade_count: typeof pd.trade_count === 'number' ? pd.trade_count : null
+            }
+          } catch (e) {
+            row.profit_error = String((e && e.message) || e)
+          }
+        }
+      })
+      return {
+        ok: true,
+        count: list.length,
+        up: upRows.length,
+        down: list.length - upRows.length,
+        open_trades_total: upRows.reduce((s, r) => s + (r.open_trades || 0), 0),
+        instances: pings
+      }
     })
 
     // ---- lifecycle + telemetry ----
@@ -1410,7 +1550,7 @@ export function apply(ctx) {
               })
               const health = []
               if (wantPing) {
-                for (const it of list) {
+                health.push(...(await mapLimit(list, 4, async (it) => {
                   let up = null
                   let latency_ms = null
                   if (it.base_url && shell !== undefined) {
@@ -1421,8 +1561,8 @@ export function apply(ctx) {
                     const code = String((r && r.stdout) || '').trim()
                     up = r.exitCode === 0 && /^2/.test(code)
                   }
-                  health.push({ name: it.name, up, latency_ms })
-                }
+                  return { name: it.name, up, latency_ms }
+                })))
               }
               res.writeHead(200, { 'Content-Type': 'application/json' })
               res.end(JSON.stringify({ count: list.length, registryFile, instances: list, health }))
