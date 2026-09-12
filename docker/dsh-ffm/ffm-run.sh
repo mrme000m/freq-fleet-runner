@@ -12,17 +12,18 @@
 # Env:
 #   IMAGE     image to run                    (default dsh-ffm:local)
 #   NAME      container name                  (default dsh-ffm)
-#   ENV_FILE  BW_* + CF_TUNNEL_TOKEN env file (default /opt/dsh-ffm/.env)
+#   ENV_FILE  BW_* env file                     (default /opt/dsh-ffm/.env)
 #   DSH_FFM_DOCKER_SOCK 1   mount /var/run/docker.sock into the container so
 #                           `host: docker` deploy flows work (default off —
 #                           the socket grants host-wide docker control)
 #
 # Ports are published on 127.0.0.1 ONLY (127.0.0.1:3083 → container :3081);
-# the public path is the CF tunnel — dsh-ffm.00m.indevs.in → http://dsh-ffm:3081
-# on the ffm-net docker network (ingress reconciled by the deploy workflow's
-# Cloudflare-API step; the `dsh-ffm-cloudflared` connector container below
-# joins ffm-net and runs the tunnel with CF_TUNNEL_TOKEN). Reach the web UI
-# directly through an SSH tunnel: ssh -L 3083:localhost:3083 <host>
+# the public path is the VM-LOCAL cloudflared tunnel (fleet-runner.yml): the
+# deploy workflow edits /root/.cloudflared/config.yml ingress
+# (dsh-ffm.00m.indevs.in → http://127.0.0.1:3083) and restarts cloudflared.
+# NO connector sidecar here — a token-managed connector would conflict with
+# the locally-managed one. Reach the web UI directly through an SSH tunnel:
+# ssh -L 3083:localhost:3083 <host>
 set -euo pipefail
 
 IMAGE="${IMAGE:-dsh-ffm:local}"
@@ -34,7 +35,6 @@ for key in BW_URL BW_CLIENTID BW_CLIENTSECRET BW_PASSWORD; do
   val="$(grep -E "^${key}=" "$ENV_FILE" | head -1 | cut -d= -f2- || true)"
   [ -n "$val" ] || { echo "ffm-run: $ENV_FILE is missing a value for $key (BW_* are required for vault_loader)" >&2; exit 1; }
 done
-CF_TUNNEL_TOKEN="$(grep -E '^CF_TUNNEL_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2-)"
 
 # docker needs sudo when the ssh user is not in the docker group
 DOCKER="${DOCKER_CMD:-}"
@@ -48,8 +48,9 @@ for v in ffm-dsh ffm-secrets ffm-bwcli; do
 done
 
 # ── network ────────────────────────────────────────────────────────────────
-# ffm-net carries the public traffic: the dsh-ffm-cloudflared connector
-# joins it and reaches dsh-ffm's dsh web by docker DNS (http://dsh-ffm:3081).
+# Public traffic does NOT flow through docker networking: the VM-local
+# cloudflared (fleet-runner.yml) targets the host publish 127.0.0.1:3083.
+# ffm-net stays as the container's plain user-defined network.
 $DOCKER network create ffm-net >/dev/null 2>&1 || true
 
 # ── graceful replace: SIGTERM + up to 60s settle, then force-remove ────────
@@ -74,21 +75,6 @@ if [ "${DSH_FFM_DOCKER_SOCK:-0}" = "1" ]; then
 fi
 $DOCKER "${RUN_ARGS[@]}" "$IMAGE"
 
-# ── connector sidecar ──────────────────────────────────────────────────────
-# When CF_TUNNEL_TOKEN is present, keep the cloudflared connector ensured on
-# ffm-net so dsh-ffm.00m.indevs.in resolves without host port publishing.
-# Replaced on every redeploy (token from the env file — never logged).
-if [ -n "$CF_TUNNEL_TOKEN" ]; then
-  $DOCKER rm -f dsh-ffm-cloudflared >/dev/null 2>&1 || true
-  $DOCKER run -d --name dsh-ffm-cloudflared \
-    --restart unless-stopped \
-    --network ffm-net \
-    cloudflare/cloudflared:latest tunnel --no-autoupdate run \
-    --token "$CF_TUNNEL_TOKEN"
-  echo "ffm-run: cloudflared connector up (dsh-ffm.00m.indevs.in → http://dsh-ffm:3081 via ffm-net)"
-else
-  echo "ffm-run: no CF_TUNNEL_TOKEN — connector not started (dsh-ffm web reachable via ssh -L 3083:localhost:3083)"
-fi
 
 echo "ffm-run: container up — boot (vault load → dsh home seed → settings render) takes ~30-90s"
 
