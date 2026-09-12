@@ -73,6 +73,14 @@ RUN_ARGS=(run -d --name "$NAME" \
 if [ "${DSH_FFM_DOCKER_SOCK:-0}" = "1" ]; then
   RUN_ARGS+=(-v /var/run/docker.sock:/var/run/docker.sock)
 fi
+# Container SSH key — the deploy workflow provisions /opt/dsh-ffm/container-ssh
+# with an ed25519 keypair (pubkey installed in the runner's authorized_keys).
+# Bind-mounted read-only at /data/ssh so the entrypoint can write a ~/.ssh/config
+# "Host ffm-vm" entry; the cf-gh skill uses it to manage the tunnel ingress on
+# the VM. Conditional: absent on a host that didn't run the deploy workflow.
+if [ -d /opt/dsh-ffm/container-ssh ]; then
+  RUN_ARGS+=(-v /opt/dsh-ffm/container-ssh:/data/ssh:ro)
+fi
 $DOCKER "${RUN_ARGS[@]}" "$IMAGE"
 
 

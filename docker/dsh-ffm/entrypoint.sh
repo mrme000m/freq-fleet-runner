@@ -41,7 +41,8 @@ mkdir -p "$DSH_HOME" /data/secrets /data/bw-cli
 
 # ── (1) vault-driven secrets (Cloudflare + LLM provider items) ──────────────
 # The fleet manager container loads NO trading secrets (no WT creds, no
-# exchange API keys) — BW_VAULT_ONLY=cf,llm,gh restricts vault_loader.sh to:
+# exchange API keys) — BW_VAULT_ONLY=cf,llm,gh,cf-tunnels restricts
+# vault_loader.sh to:
 # the two Cloudflare items (opencode-cloudflare: CLOUDFLARE_ACCOUNT_ID/API_KEY;
 # cloudflare-tunnels: CF_ACCOUNT_ID + CF_API_TOKEN_READ/WRITE for the cf
 # skill), the LLM provider keys (provider-keys → NVIDIA_API_KEY,
@@ -50,8 +51,8 @@ mkdir -p "$DSH_HOME" /data/secrets /data/bw-cli
 # Fail-soft: no BW_* env → exit 0 "vault disabled" inside the loader; a
 # failed load warns and continues.
 if [ -n "${BW_URL:-}" ] && [ -n "${BW_CLIENTID:-}" ] && [ -n "${BW_CLIENTSECRET:-}" ] && [ -n "${BW_PASSWORD:-}" ]; then
-  log "vault enabled — running vault_loader.sh (BW_VAULT_ONLY=cf,llm,gh)"
-  if BW_VAULT_ONLY=cf,llm,gh bash "$FFM/vault_loader.sh"; then
+  log "vault enabled — running vault_loader.sh (BW_VAULT_ONLY=cf,llm,gh,cf-tunnels)"
+  if BW_VAULT_ONLY=cf,llm,gh,cf-tunnels bash "$FFM/vault_loader.sh"; then
     log "vault load complete"
   else
     warn "vault_loader.sh failed (exit $?) — continuing with inline env"
@@ -97,16 +98,21 @@ if [ "$BAKED_REV" != "$SEEDED_REV" ]; then
     cp -a "$SEED_HOME/." "$DSH_HOME/"
   else
     log "dsh home: image revision changed ($SEEDED_REV → $BAKED_REV) — refreshing baked files"
-    for f in preset.yml agent.cordis.yml skills/ffm-operations/SKILL.md \
-             skills/editing-cordis-compositions/SKILL.md \
-             skills/cordis-plugin-development/SKILL.md; do
+    # Refresh EVERY baked file under the preset (recursive), preserving
+    # operator edits: a file the operator changed locally (no longer
+    # identical to the previously seeded copy under .last-seed/) is left
+    # untouched. This generalizes the old fixed file list so new skills
+    # (cf-gh) and the ffm-operations references/ tree are picked up on
+    # image updates instead of silently missing from the runtime preset.
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
       if [ ! -e "$DSH_HOME/.agent-presets/ffm/$f" ] || cmp -s "$DSH_HOME/.last-seed/ffm/$f" "$DSH_HOME/.agent-presets/ffm/$f"; then
         mkdir -p "$DSH_HOME/.agent-presets/ffm/$(dirname "$f")"
         cp -a "$SEED_HOME/.agent-presets/ffm/$f" "$DSH_HOME/.agent-presets/ffm/$f"
       else
         warn "dsh home: .agent-presets/ffm/$f was edited locally — preserved (image update skipped for it)"
       fi
-    done
+    done < <(cd "$SEED_HOME/.agent-presets/ffm" && find . -type f | sed 's|^\./||')
     if [ -e "$DSH_HOME/.keep-profile" ]; then
       log "dsh home: .keep-profile present — baked web profile left untouched"
     else
@@ -191,6 +197,44 @@ else
   else
     warn "self-mod repo: fetch failed"
   fi
+fi
+
+# ── (3c) VM SSH — let the agent reach the fleet-runner VM from the container ─
+# The dsh-ffm container runs ON the VM; it reaches the VM's sshd (runner user,
+# passwordless sudo) via the docker bridge default gateway (the VM's host IP
+# on ffm-net, usually 172.18.0.1). The deploy workflow provisions a dedicated
+# keypair at /opt/dsh-ffm/container-ssh (bind-mounted here at /data/ssh) and
+# installs its pubkey in the runner's authorized_keys. We write a ~/.ssh/config
+# Host entry "ffm-vm" so the agent just does `ssh ffm-vm '<cmd>'` to manage the
+# tunnel ingress (/root/.cloudflared/config.yml) and the host. Fail-soft: no
+# key → the cf-gh skill's VM step is unavailable (the agent can still use the
+# CF API for DNS, but not the local ingress config).
+mkdir -p /root/.ssh
+if [ -f /data/ssh/id_ed25519 ]; then
+  chmod 600 /data/ssh/id_ed25519
+  # the bridge default route (little-endian hex in /proc/net/route)
+  gw_hex="$(awk 'NR>1 && $2=="00000000" {print $3; exit}' /proc/net/route)"
+  if [ -n "$gw_hex" ]; then
+    gw="$(printf '%d.%d.%d.%d' \
+      0x"${gw_hex:6:2}" 0x"${gw_hex:4:2}" 0x"${gw_hex:2:2}" 0x"${gw_hex:0:2}")"
+    cat > /root/.ssh/config <<EOF
+Host ffm-vm
+    HostName $gw
+    User runner
+    IdentityFile /data/ssh/id_ed25519
+    IdentitiesOnly yes
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+EOF
+    chmod 600 /root/.ssh/config
+    log "vm ssh: ffm-vm → $gw (key /data/ssh/id_ed25519)"
+  else
+    warn "vm ssh: key present but no default route in /proc/net/route — ffm-vm not configured"
+  fi
+else
+  warn "vm ssh: no /data/ssh/id_ed25519 — the deploy did not provision the container key; ssh ffm-vm unavailable"
 fi
 
 # ── (4) dsh web — the fleet manager agent, FOREGROUND (its death = container death) ──

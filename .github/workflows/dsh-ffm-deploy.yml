@@ -207,6 +207,23 @@ jobs:
           ENVEOF
           $SSH_CMD "chmod 600 $REMOTE_DIR/.env && grep -c '^[A-Z]' $REMOTE_DIR/.env"
 
+      - name: Ensure the container's VM SSH key
+        # Provision a dedicated ed25519 keypair at /opt/dsh-ffm/container-ssh
+        # so the dsh-ffm agent can SSH into the VM (runner user, passwordless
+        # sudo) via the docker bridge gateway — used by the cf-gh skill to
+        # manage /root/.cloudflared/config.yml ingress. The key persists across
+        # redeploys (only regenerated on a fresh VM where the dir is empty).
+        # Pubkey is idempotently appended to the runner's authorized_keys.
+        run: |
+          $SSH_CMD 'sudo mkdir -p /opt/dsh-ffm/container-ssh && sudo chown ${{ secrets.SSH_USER }} /opt/dsh-ffm/container-ssh'
+          $SSH_CMD 'if [ ! -f /opt/dsh-ffm/container-ssh/id_ed25519 ]; then
+                       ssh-keygen -t ed25519 -N "" -f /opt/dsh-ffm/container-ssh/id_ed25519 -C dsh-ffm-agent;
+                     fi'
+          $SSH_CMD 'chmod 600 /opt/dsh-ffm/container-ssh/id_ed25519 && chmod 644 /opt/dsh-ffm/container-ssh/id_ed25519.pub'
+          $SSH_CMD 'PUB="$(cat /opt/dsh-ffm/container-ssh/id_ed25519.pub)";
+                    grep -qF "$PUB" ~/.ssh/authorized_keys 2>/dev/null || echo "$PUB" >> ~/.ssh/authorized_keys;
+                    chmod 600 ~/.ssh/authorized_keys'
+
       - name: Ship the runner script and start the container
         run: |
           scp -F ~/.ssh/grid_config \

@@ -20,7 +20,7 @@ http://localhost:3083.
 | `Dockerfile` | The image (multi-ARCH amd64; dsh `0.1.5-rc.1` default) |
 | `entrypoint.sh` | PID-1 supervisor: vault → seed → settings render → `exec dsh web` |
 | `healthcheck.sh` | `curl http://127.0.0.1:$DSH_WEB_PORT/` (Docker HEALTHCHECK) |
-| `vault_loader.sh` | Bitwarden machine-auth loader, `BW_VAULT_ONLY=cf,llm` |
+| `vault_loader.sh` | Bitwarden machine-auth loader, `BW_VAULT_ONLY=cf,llm,gh,cf-tunnels` |
 | `dsh-settings.yaml` | LLM catalog **template** (CF Workers AI default; `@CF_ACCOUNT_ID@` rendered at boot) |
 | `dsh_ponytail_patch.py` | Patches dsh-web-app so `--host 0.0.0.0` is allowed |
 | `pnpm_allowbuilds.py` | pnpm build-script allowlist remedy for `dsh plugin add` |
@@ -102,13 +102,16 @@ settings render → dsh web).
 
 ## Secrets contract
 
-- The container loads **only** Cloudflare + LLM provider items + the GitHub
-  fleet token (`BW_VAULT_ONLY=cf,llm,gh`): `opencode-cloudflare`
+- The container loads Cloudflare + LLM provider items + the GitHub
+  fleet token + the CF tunnel tokens
+  (`BW_VAULT_ONLY=cf,llm,gh,cf-tunnels`): `opencode-cloudflare`
   (`CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_API_KEY`), `cloudflare-tunnels`
   (folder `cloudflare`: `CF_ACCOUNT_ID` + `CF_API_TOKEN_READ/WRITE`),
   `provider-keys` (`NVIDIA_API_KEY`/`OPENROUTER_API_KEY`/`MISTRAL_API_KEY`),
-  and `github-fleet-token` (notes `GH_FLEET_TOKEN=ghp_…` — a fine-grained PAT
-  scoped to `mrme000m/freq-fleet-runner`, `Contents: read & write`).
+  and `github-fleet-token` (notes `GH_FLEET_TOKEN=gho_…` — the operator's gh
+  CLI OAuth token, user-scoped `repo`). The `cf-tunnels` group was added so
+  the agent has the CF API read/write tokens needed by the cf-gh skill's
+  tunnel host management playbook.
 - No trading credentials are baked or loaded. Per-instance API secrets live in
   the container's `credentials` host service via `ft_secret_set` (refs
   `FTMGR_<NAME>_<KIND>`), persisted in the `ffm-dsh` volume.
@@ -153,3 +156,39 @@ this repo in the persistent volume:
 - **Gating**: the clone/fetch fail soft (warn + continue) when GitHub is
   unreachable; push is the only step that requires the token. Without
   `GH_FLEET_TOKEN` the agent can still edit locally, just not push.
+
+## The cf-gh skill — Cloudflare tunnel + Bitwarden vault management
+
+The `ffm` preset ships a dedicated skill, `agent-presets/ffm/skills/cf-gh/`,
+  auto-discovered via the `skill-filesystem` row's `customSkillDirs: [skills/]`
+  in `agent.cordis.yml` (no preset change needed to add skills). It teaches the
+agent to:
+
+- **Manage CF tunnel hosts**: edit `/root/.cloudflared/config.yml` on the VM
+  (add/remove ingress rules via python3 yaml), restart cloudflared detached
+  (setsid + sleep 2 + pkill — cloudflared carries the SSH connection), and
+  create/update/remove DNS CNAMEs via the CF API write token
+  (`CF_API_TOKEN_WRITE`). The agent reaches the VM over SSH via the `ffm-vm`
+  host entry.
+- **Access the Bitwarden vault**: auth flow (machine-auth via `BW_*` env),
+  search/get/create/delete items, and the bw 2026.8.0 gotchas (omit
+  `favorite`/`reprompt` on create, `bw delete item <id>` not `--yes`,
+  `bw list items --search` not `bw get --json`). Items in the `cloudflare`
+  folder use notes `KEY=VAL` convention for custom fields.
+- **Self-modify**: the skill points back at `/data/dsh/repo` and the
+  `GH_FLEET_TOKEN` push flow.
+
+### Container SSH key (`/data/ssh`)
+
+The deploy workflow provisions a dedicated ed25519 keypair at
+`/opt/dsh-ffm/container-ssh` on the VM (persisted across redeploys, regenerated
+only on a fresh VM). It's bind-mounted read-only into the container at
+`/data/ssh`, and the entrypoint writes `/root/.ssh/config` with a `Host ffm-vm`
+entry that targets the docker bridge gateway (discovered from
+`/proc/net/route`) as user `runner`. This lets the agent run `ssh ffm-vm
+'<cmd>'` to manage the tunnel ingress and the host. The deploy step
+idempotently installs the pubkey in the runner's `~/.ssh/authorized_keys`.
+
+If the key is absent (e.g. a manual `ffm-run.sh` without the deploy workflow),
+the entrypoint warns and the cf-gh skill's VM SSH step is unavailable — the
+agent can still use the CF API for DNS, but not the local ingress config.
