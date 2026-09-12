@@ -146,12 +146,29 @@ jobs:
             sudo dpkg -i /tmp/cloudflared.deb
             install -m 600 /dev/null ~/.cloudflared/cert.pem
             printf '%s\n' "${{ secrets.CF_ACCESS_CERT_PEM }}" > ~/.cloudflared/cert.pem
-            ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
-            echo "SSH_CMD=ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} -o BatchMode=yes -o ProxyCommand='cloudflared access ssh --hostname ${{ secrets.SSH_HOST }}' ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" >> "$GITHUB_ENV"
+            PROXY_CMD="cloudflared access ssh --hostname ${{ secrets.SSH_HOST }}"
           else
-            ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
-            echo "SSH_CMD=ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} -o BatchMode=yes ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" >> "$GITHUB_ENV"
+            PROXY_CMD=""
           fi
+          # A config FILE (not inline -o args) sidesteps word-splitting
+          # entirely: $SSH_CMD carries no quotes, so it survives being
+          # expanded and appended-to in later steps.
+          {
+            echo "Host grid-ffm"
+            echo "    HostName ${{ secrets.SSH_HOST }}"
+            echo "    User ${{ secrets.SSH_USER }}"
+            echo "    Port ${{ secrets.SSH_PORT }}"
+            echo "    IdentityFile ~/.ssh/deploy_key"
+            echo "    IdentitiesOnly yes"
+            echo "    BatchMode yes"
+            echo "    StrictHostKeyChecking no"
+            echo "    UserKnownHostsFile /dev/null"
+            echo "    ServerAliveInterval 30"
+            echo "    ServerAliveCountMax 6"
+            [ -n "$PROXY_CMD" ] && echo "    ProxyCommand $PROXY_CMD"
+          } > ~/.ssh/grid_config
+          chmod 600 ~/.ssh/grid_config
+          echo "SSH_CMD=ssh -F ~/.ssh/grid_config grid-ffm" >> "$GITHUB_ENV"
 
       - name: Log the VM into GHCR (idempotent)
         if: env.TRANSPORT == 'ghcr'
@@ -191,10 +208,9 @@ jobs:
 
       - name: Ship the runner script and start the container
         run: |
-          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
-            -o ProxyCommand='cloudflared access ssh --hostname ${{ secrets.SSH_HOST }}' \
+          scp -F ~/.ssh/grid_config \
             docker/dsh-ffm/ffm-run.sh \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:$REMOTE_DIR/ffm-run.sh"
+            grid-ffm:$REMOTE_DIR/ffm-run.sh
           $SSH_CMD "chmod +x $REMOTE_DIR/ffm-run.sh"
           $SSH_CMD "IMAGE='${{ env.IMAGE }}:${{ github.sha }}' NAME='$NAME' bash $REMOTE_DIR/ffm-run.sh"
 
