@@ -87,6 +87,7 @@ COPY freqtrade-fleet-manager/package.json freqtrade-fleet-manager/cordis.patch.y
      freqtrade-fleet-manager/README.md freqtrade-fleet-manager/LICENSE /opt/ffm-plugin/
 COPY freqtrade-fleet-manager/lib/ /opt/ffm-plugin/lib/
 COPY docker/dsh-ffm/pnpm_allowbuilds.py /tmp/pnpm_allowbuilds.py
+COPY docker/dsh-ffm/pin-gate/ /opt/pin-gate/
 RUN set -eux; \
     if ! DSH_HOME=/opt/dsh-home dsh plugin --profile web add /opt/ffm-plugin \
             > /tmp/plugin-add.log 2>&1; then \
@@ -100,7 +101,11 @@ RUN set -eux; \
     mkdir -p /opt/ffm-plugin/node_modules/@deepseek-ai; \
     ln -sfn "$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools" \
         /opt/ffm-plugin/node_modules/@deepseek-ai/dsh-tools; \
-    test -f /opt/ffm-plugin/node_modules/@deepseek-ai/dsh-tools/lib/index.js
+    test -f /opt/ffm-plugin/node_modules/@deepseek-ai/dsh-tools/lib/index.js; \
+    DSH_HOME=/opt/dsh-home dsh plugin --profile web add /opt/pin-gate; \
+    test -f /opt/dsh-home/profiles/web/node_modules/dsh-pin-gate/index.js; \
+    ln -sfn /opt/pin-gate /opt/dsh-home/profiles/web/node_modules/dsh-pin-gate; \
+    test "$(readlink /opt/dsh-home/profiles/web/node_modules/dsh-pin-gate)" = "/opt/pin-gate"
 
 # ── FFM payloads (cheap COPYs — always LAST) ───────────────────────────────
 # All preset payloads land in the SEED home /opt/dsh-home; the entrypoint

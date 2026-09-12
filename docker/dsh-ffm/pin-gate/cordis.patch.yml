@@ -1,0 +1,13 @@
+# dsh-pin-gate bundle patch.
+#
+# Installing this package through the official CLI —
+#
+#   dsh plugin --profile web add ./path/to/dsh-pin-gate
+#
+# — appends a single host row to the profile bundle stack. The host entry
+# registers a /pin named route on the host web server; because named routes
+# answer before the SPA fallback (which serves the token/401 index gate),
+# /pin is reachable without an existing browser-auth cookie.
+- insert:
+    - id: dsh-pin-gate
+      name: 'dsh-pin-gate'

@@ -202,6 +202,7 @@ jobs:
           BW_PASSWORD=${{ secrets.BW_PASSWORD }}
           BW_CLIENTID=${{ secrets.BW_CLIENTID }}
           BW_CLIENTSECRET=${{ secrets.BW_CLIENTSECRET }}
+          FFM_PIN=${{ secrets.FFM_PIN }}
           CF_TUNNEL_TOKEN=
           ENVEOF
           $SSH_CMD "chmod 600 $REMOTE_DIR/.env && grep -c '^[A-Z]' $REMOTE_DIR/.env"
@@ -315,3 +316,15 @@ jobs:
         if: always()
         run: |
           $SSH_CMD 'sudo docker ps --filter name='"$NAME"' --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"; echo; sudo docker images --format "{{.Repository}}:{{.Tag}} {{.Size}}" | head -5; echo; sudo docker logs --tail 40 '"$NAME"' 2>&1 | grep -iE "dsh|ffm|preset|vault|seed|freqtrade|plugin" || true'
+
+      - name: Public access URL
+        if: always()
+        run: |
+          TOKEN="$($SSH_CMD 'sudo docker logs '"$NAME"' 2>&1 | grep -oE "token=[A-Za-z0-9_-]+" | head -1 | cut -d= -f2' 2>/dev/null | tail -1)"
+          echo "── dsh-ffm access ──"
+          echo "PIN login:  https://dsh-ffm.00m.indevs.in/pin"
+          if [ -n "$TOKEN" ]; then
+            echo "Direct:     https://dsh-ffm.00m.indevs.in/?token=$TOKEN"
+          else
+            echo "Direct:     (token not found in logs)"
+          fi

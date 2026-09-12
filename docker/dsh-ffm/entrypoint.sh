@@ -125,6 +125,7 @@ fi
 # which does not exist). Force the absolute target each boot — idempotent,
 # and /opt/ffm-plugin is baked into the image (never a volume).
 ln -sfn /opt/ffm-plugin "$DSH_HOME/profiles/web/node_modules/freqtrade-fleet-manager" 2>/dev/null || true
+ln -sfn /opt/pin-gate "$DSH_HOME/profiles/web/node_modules/dsh-pin-gate" 2>/dev/null || true
 
 # settings.yaml — derived from the baked template each boot. Two sources of
 # truth: (a) the baked TEMPLATE (image-owned) and (b) operator edits to the

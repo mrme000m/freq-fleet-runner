@@ -1,0 +1,15 @@
+{
+  "name": "dsh-pin-gate",
+  "version": "0.1.0",
+  "description": "PIN login gate for the dsh-ffm web UI: a named /pin route (runs before the SPA fallback's 401) that redirects a correct PIN to the dsh launch-token URL, minting the ordinary browser-auth cookie.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
