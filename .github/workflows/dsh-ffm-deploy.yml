@@ -301,7 +301,7 @@ jobs:
           # dsh web serves 127.0.0.1:3083 on the VM (the publish maps to the
           # in-container :3081). First boot may take ~30-90s.
           for i in $(seq 1 24); do
-            if $SSH_CMD 'curl -fs -m 5 http://127.0.0.1:3083/' >/dev/null 2>&1; then
+            if $SSH_CMD 'curl -s -o /dev/null -m 5 http://127.0.0.1:3083/' >/dev/null 2>&1; then
               echo "healthy after ~$((i * 15))s"
               exit 0
             fi

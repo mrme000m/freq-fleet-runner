@@ -96,7 +96,11 @@ RUN set -eux; \
     fi; \
     test -f /opt/dsh-home/profiles/web/node_modules/freqtrade-fleet-manager/lib/index.js; \
     ln -sfn /opt/ffm-plugin /opt/dsh-home/profiles/web/node_modules/freqtrade-fleet-manager; \
-    test "$(readlink /opt/dsh-home/profiles/web/node_modules/freqtrade-fleet-manager)" = "/opt/ffm-plugin"
+    test "$(readlink /opt/dsh-home/profiles/web/node_modules/freqtrade-fleet-manager)" = "/opt/ffm-plugin"; \
+    mkdir -p /opt/ffm-plugin/node_modules/@deepseek-ai; \
+    ln -sfn "$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools" \
+        /opt/ffm-plugin/node_modules/@deepseek-ai/dsh-tools; \
+    test -f /opt/ffm-plugin/node_modules/@deepseek-ai/dsh-tools/lib/index.js
 
 # ── FFM payloads (cheap COPYs — always LAST) ───────────────────────────────
 # All preset payloads land in the SEED home /opt/dsh-home; the entrypoint
@@ -123,5 +127,5 @@ ENV DSH_HOME=/data/dsh \
 EXPOSE 3081
 STOPSIGNAL SIGTERM
 HEALTHCHECK --start-period=2m --interval=30s --timeout=10s --retries=3 \
-  CMD curl -fs -m 5 http://127.0.0.1:3081/ || exit 1
+  CMD curl -s -o /dev/null -m 5 http://127.0.0.1:3081/ || exit 1
 ENTRYPOINT ["/app/ffm/entrypoint.sh"]
