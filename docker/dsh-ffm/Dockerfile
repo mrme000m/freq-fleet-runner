@@ -10,7 +10,8 @@
 # Modeled on the grid-ga container (tvcli repo, docker/ga/): the same boot
 # contract (vault_loader → dsh-home seed → settings render → foreground dsh
 # web) and the same ponytail patch so `dsh web --host 0.0.0.0` is allowed.
-# dsh version: npm `latest` 0.1.5-rc.1 (verified in this workspace against
+# dsh version: 0.1.5-rc.2 (git tag dsh-v0.1.5-rc.2, npm `next` — one RC newer
+# than npm `latest` 0.1.5-rc.1, which was verified in this workspace against
 # master HEAD c291e7961a51 — the freqtrade-fleet-manager plugin installs
 # cleanly on it via the local-checkout path, all 54 tools register, the web
 # profile serves, and every preset row of the cloned cordis composition
@@ -53,8 +54,9 @@ RUN npm install -g --no-fund --no-audit @bitwarden/cli \
     && bw --version
 
 # ── DSH (deepseek-harness) — the agent runtime ─────────────────────────────
-# dsh = npm `latest` 0.1.5-rc.1 (the freqtrade-fleet-manager plugin's
-# peer-compat table lists 0.1.0-rc.7 / 0.1.1-rc.2, but 0.1.5-rc.1 was verified
+# dsh = 0.1.5-rc.2 (npm `next`; `latest` 0.1.5-rc.1 was the prior verified
+# pin — the freqtrade-fleet-manager plugin's peer-compat table lists
+# 0.1.0-rc.7 / 0.1.1-rc.2, but 0.1.5-rc.1 was verified
 # compatible in this workspace — `dsh plugin --profile web add` installs it,
 # `apply()` registers the 54 tools, and all 26 preset rows of the cloned
 # cordis composition resolve). pnpm >= 10 (the `dsh plugin` forwarder) + the
@@ -63,7 +65,7 @@ RUN npm install -g --no-fund --no-audit @bitwarden/cli \
 # npm cache is dropped IN THE SAME LAYER so the bytes never enter the image
 # history. Pin any future dsh with a verified-compatible version by passing
 # --build-arg DSH_VERSION=<ver>.
-ARG DSH_VERSION=0.1.5-rc.1
+ARG DSH_VERSION=0.1.5-rc.2
 COPY docker/dsh-ffm/dsh_ponytail_patch.py /tmp/dsh_ponytail_patch.py
 RUN set -eux; \
     npm install -g --no-fund --no-audit pnpm@10; \
