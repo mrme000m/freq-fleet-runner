@@ -76,7 +76,7 @@ export function apply(ctx) {
     return
   }
 
-  ctx.inject(['webServer'], (webCtx) => {
+  ctx.inject(['webServer', 'connection'], (webCtx) => {
     const webServer = webCtx.get('webServer')
     const connection = webCtx.get('connection')
     if (webServer === undefined || connection === undefined) {
