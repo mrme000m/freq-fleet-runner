@@ -119,7 +119,8 @@ COPY docker/dsh-ffm/dsh-settings.yaml /opt/dsh-home/settings.yaml
 COPY docker/dsh-ffm/entrypoint.sh /app/ffm/entrypoint.sh
 COPY docker/dsh-ffm/healthcheck.sh /app/ffm/healthcheck.sh
 COPY docker/dsh-ffm/vault_loader.sh /app/ffm/vault_loader.sh
-RUN chmod +x /app/ffm/entrypoint.sh /app/ffm/healthcheck.sh /app/ffm/vault_loader.sh \
+COPY docker/dsh-ffm/git-askpass.sh /app/ffm/git-askpass.sh
+RUN chmod +x /app/ffm/entrypoint.sh /app/ffm/healthcheck.sh /app/ffm/vault_loader.sh /app/ffm/git-askpass.sh \
     && mkdir -p /data/dsh /data/secrets /data/bw-cli \
     && printf '%s\n' "${FFM_PRESET_REV}" > /opt/dsh-home/.baked-rev
 

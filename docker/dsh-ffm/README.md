@@ -102,11 +102,13 @@ settings render → dsh web).
 
 ## Secrets contract
 
-- The container loads **only** Cloudflare + LLM provider items
-  (`BW_VAULT_ONLY=cf,llm`): `opencode-cloudflare`
+- The container loads **only** Cloudflare + LLM provider items + the GitHub
+  fleet token (`BW_VAULT_ONLY=cf,llm,gh`): `opencode-cloudflare`
   (`CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_API_KEY`), `cloudflare-tunnels`
-  (folder `cloudflare`: `CF_ACCOUNT_ID` + `CF_API_TOKEN_READ/WRITE`), and
-  `provider-keys` (`NVIDIA_API_KEY`/`OPENROUTER_API_KEY`/`MISTRAL_API_KEY`).
+  (folder `cloudflare`: `CF_ACCOUNT_ID` + `CF_API_TOKEN_READ/WRITE`),
+  `provider-keys` (`NVIDIA_API_KEY`/`OPENROUTER_API_KEY`/`MISTRAL_API_KEY`),
+  and `github-fleet-token` (notes `GH_FLEET_TOKEN=ghp_…` — a fine-grained PAT
+  scoped to `mrme000m/freq-fleet-runner`, `Contents: read & write`).
 - No trading credentials are baked or loaded. Per-instance API secrets live in
   the container's `credentials` host service via `ft_secret_set` (refs
   `FTMGR_<NAME>_<KIND>`), persisted in the `ffm-dsh` volume.
@@ -125,3 +127,29 @@ settings render → dsh web).
   Settings → Freqtrade Fleet dashboard.
 - **Logs**: `dsh-web.log` in the volume + container stdout
   (`docker logs`), boot progress under `[ffm-entrypoint ...]`.
+
+## Self-modification — the agent updates its own source
+
+The `ffm` preset is a clone of Creator Mode (`cordis`), so the agent is meant
+to *author and improve its own code*. To make those edits durable (and to let
+them flow back to the dev workspace), the container keeps a git checkout of
+this repo in the persistent volume:
+
+- **Checkout**: `/data/dsh/repo` — a clone of
+  `https://github.com/mrme000m/freq-fleet-runner.git`, fetched to `origin/main`
+  at every boot (first boot clones; later boots `git fetch`). It lives in the
+  `ffm-dsh` volume, so in-progress edits survive redeploys.
+- **Push credential**: `GH_FLEET_TOKEN` (vault item `github-fleet-token`),
+  supplied to git via `core.askPass` → `git-askpass.sh` (the token is never
+  written into git config or a file — read from env at push time, so rotation
+  is transparent). Identity is `dsh-ffm-agent <dsh-ffm-agent@mrme000m.invalid>`.
+- **Round-trip**: the agent edits `docker/dsh-ffm/**` or
+  `freqtrade-fleet-manager/**` in `/data/dsh/repo`, `git commit` + `git push
+  origin main`. The push triggers `.github/workflows/dsh-ffm-deploy.yml`
+  (path-filtered on those directories), which rebuilds + redeploys this
+  container — the agent has updated itself. The dev workspace
+  (`grid/0/freqtrade`) is a git checkout of the same repo and `git pull`s the
+  agent's changes back.
+- **Gating**: the clone/fetch fail soft (warn + continue) when GitHub is
+  unreachable; push is the only step that requires the token. Without
+  `GH_FLEET_TOKEN` the agent can still edit locally, just not push.

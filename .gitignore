@@ -1,0 +1,32 @@
+# ── local dev workspace noise (not part of the freq-fleet-runner repo) ──────
+# The upstream freqtrade clone is a local reference only — the repo ships the
+# dsh-ffm container + the freqtrade-fleet-manager plugin, not freqtrade itself.
+freqtrade/
+
+# local skills + design scratch kept on this machine only
+.vibe/
+PLUGIN_DESIGN.md
+dash_client.js
+dash_host.js
+distilled_schema.json
+host_v2.js
+host_v2.template.js
+host_v3.js
+host_v3.block.js
+host_v3.template.js
+
+# ── node/pnpm/python hygiene ────────────────────────────────────────────────
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# ── secrets & scratch ───────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+*id_rsa*
+known_hosts
+*.log
+.DS_Store

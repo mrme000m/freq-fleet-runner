@@ -70,6 +70,28 @@ disagree.
    `ws_token`). Remote instances must bind `api_server.listen_ip_address` to
    `0.0.0.0` (or be reached through an SSH tunnel) for the agent to reach them.
 
+## Self-modification — updating this agent's own code
+
+This container keeps its own source at **`/data/dsh/repo`** — a git clone of
+`mrme000m/freq-fleet-runner` (`docker/dsh-ffm/**` container build,
+`freqtrade-fleet-manager/**` plugin, and the deploy workflow). Use it to make
+code changes durable:
+
+1. Edit files under `/data/dsh/repo` (`docker/dsh-ffm/…` or
+   `freqtrade-fleet-manager/…`).
+2. When you touch `freqtrade-fleet-manager/src/index.js`, rebuild and commit the
+   refreshed `lib/`: `cd /data/dsh/repo/freqtrade-fleet-manager && pnpm
+   install --frozen-lockfile && pnpm run build` (CI does the same, but commit
+   `lib/` so the image ships your build).
+3. Commit and push:
+   `git -C /data/dsh/repo add -A && git -C /data/dsh/repo commit -m "…" &&
+   git -C /data/dsh/repo push origin main`. The push triggers the
+   dsh-ffm-deploy workflow, which rebuilds + redeploys this container (the
+   agent self-updates). Push auth comes from `GH_FLEET_TOKEN` via the git
+   askpass helper — never echo or log it.
+4. Push only to `main`, and keep changes scoped to `docker/dsh-ffm/**` and
+   `freqtrade-fleet-manager/**` so the path-filtered workflow fires.
+
 ## Gotchas
 
 - **`dry_run: true` is the safe posture.** The fleet's deployed instance

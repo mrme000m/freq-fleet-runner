@@ -7,6 +7,7 @@
 #   provider-keys        (fields)                       → NVIDIA_API_KEY, OPENROUTER_API_KEY,
 #                                                        MISTRAL_VIBE_API_KEY→MISTRAL_API_KEY, [NVIDIA_BASE_URL]
 #   opencode-cloudflare  (notes KEY=VAL)                → CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_KEY
+#   github-fleet-token   (notes KEY=VAL)                → GH_FLEET_TOKEN (agent git push access)
 #   tvcli-primary-env    (notes KEY=VAL)                → /app/.env (only when absent — mounted file wins)
 #   wundertrading-session(notes WT_*)                   → wt-session.env (only when absent — cookies win)
 #
@@ -19,7 +20,7 @@
 #
 # Env: BW_URL, BW_CLIENTID, BW_CLIENTSECRET, BW_PASSWORD (all four required)
 #      BITWARDENCLI_APPDATA_DIR (default /data/bw-cli — persistent CLI state)
-#      BW_VAULT_ONLY=llm,wt,tv,cf,session (optional subset filter)
+#      BW_VAULT_ONLY=llm,wt,tv,cf,cf-tunnels,session,gh (optional subset filter)
 #      GRID_VAULT_ENV_OUT / TVCLI_ENV_OUT / WT_SESSION_OUT (path overrides, CI)
 set -euo pipefail
 
@@ -216,6 +217,35 @@ print(f"__COUNT\t{n}")')"
   else
     SUMMARY="${SUMMARY} cf-tunnels MISSING,"
     warn "vault item 'cloudflare-tunnels' (folder cloudflare) not found"
+  fi
+fi
+
+# ── gh: github-fleet-token (notes KEY=VAL → GH_FLEET_TOKEN) ─────────────────
+# A fine-grained GitHub PAT scoped to mrme000m/freq-fleet-runner (Contents:
+# read & write). The agent uses it to commit+push its own source edits from
+# /data/dsh/repo back to the repo — a push to docker/dsh-ffm/** or
+# freqtrade-fleet-manager/** triggers the dsh-ffm-deploy workflow → redeploy.
+if want gh; then
+  item="$(pick_item github-fleet-token)"
+  if [ -n "$item" ]; then
+    got="$(printf '%s' "$item" | python3 -c '
+import json, shlex, sys
+i = json.load(sys.stdin)
+for line in (i.get("notes") or "").splitlines():
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line: continue
+    k, _, v = line.partition("=")
+    k, v = k.strip(), v.strip()
+    if k == "GH_FLEET_TOKEN" and v: print("GH_FLEET_TOKEN\t" + shlex.quote(v))')"
+    n=0
+    while IFS=$'\t' read -r k v; do
+      [ -n "$k" ] && { env_append "$k" "$v"; n=$((n+1)); }
+    done <<< "$got"
+    SUMMARY="${SUMMARY} gh+${n},"
+    log "item 'github-fleet-token': ${n} token keys loaded"
+  else
+    SUMMARY="${SUMMARY} gh MISSING,"
+    warn "vault item 'github-fleet-token' not found — agent git push disabled"
   fi
 fi
 

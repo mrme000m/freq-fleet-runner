@@ -41,15 +41,17 @@ mkdir -p "$DSH_HOME" /data/secrets /data/bw-cli
 
 # ── (1) vault-driven secrets (Cloudflare + LLM provider items) ──────────────
 # The fleet manager container loads NO trading secrets (no WT creds, no
-# exchange API keys) — BW_VAULT_ONLY=cf,llm restricts vault_loader.sh to: the
-# two Cloudflare items (opencode-cloudflare: CLOUDFLARE_ACCOUNT_ID/API_KEY;
+# exchange API keys) — BW_VAULT_ONLY=cf,llm,gh restricts vault_loader.sh to:
+# the two Cloudflare items (opencode-cloudflare: CLOUDFLARE_ACCOUNT_ID/API_KEY;
 # cloudflare-tunnels: CF_ACCOUNT_ID + CF_API_TOKEN_READ/WRITE for the cf
-# skill) and the LLM provider keys (provider-keys → NVIDIA_API_KEY,
-# OPENROUTER_API_KEY, MISTRAL_API_KEY). Fail-soft: no BW_* env → exit 0
-# "vault disabled" inside the loader; a failed load warns and continues.
+# skill), the LLM provider keys (provider-keys → NVIDIA_API_KEY,
+# OPENROUTER_API_KEY, MISTRAL_API_KEY), and the GitHub fleet token
+# (github-fleet-token → GH_FLEET_TOKEN, the agent's git push credential).
+# Fail-soft: no BW_* env → exit 0 "vault disabled" inside the loader; a
+# failed load warns and continues.
 if [ -n "${BW_URL:-}" ] && [ -n "${BW_CLIENTID:-}" ] && [ -n "${BW_CLIENTSECRET:-}" ] && [ -n "${BW_PASSWORD:-}" ]; then
-  log "vault enabled — running vault_loader.sh (BW_VAULT_ONLY=cf,llm)"
-  if BW_VAULT_ONLY=cf,llm bash "$FFM/vault_loader.sh"; then
+  log "vault enabled — running vault_loader.sh (BW_VAULT_ONLY=cf,llm,gh)"
+  if BW_VAULT_ONLY=cf,llm,gh bash "$FFM/vault_loader.sh"; then
     log "vault load complete"
   else
     warn "vault_loader.sh failed (exit $?) — continuing with inline env"
@@ -158,6 +160,37 @@ if [ -n "$CF_ACCOUNT_ID" ]; then
   fi
 else
   warn "dsh home: no CF account id in env — settings.yaml not rendered (sessions need the CLOUDFLARE_* env)"
+fi
+
+# ── (3b) self-modification repo — checkout of this container's own source ──
+# /data/dsh/repo is a git clone of mrme000m/freq-fleet-runner (docker/dsh-ffm,
+# freqtrade-fleet-manager, the deploy workflow) in the persistent ffm-dsh
+# volume. The ffm preset edits code there, commits, and pushes with
+# GH_FLEET_TOKEN (supplied via core.askPass → git-askpass.sh). A push touching
+# docker/dsh-ffm/** or freqtrade-fleet-manager/** triggers the
+# dsh-ffm-deploy workflow, which rebuilds + redeploys THIS container. The repo
+# is public, so a clone works without the token; only push needs it.
+export GIT_ASKPASS="$FFM/git-askpass.sh"
+git config --global core.askPass "$FFM/git-askpass.sh"
+git config --global user.name  "dsh-ffm-agent"
+git config --global user.email "dsh-ffm-agent@mrme000m.invalid"
+git config --global init.defaultBranch main
+git config --global pull.rebase true
+REPO_URL="https://github.com/mrme000m/freq-fleet-runner.git"
+REPO_DIR="$DSH_HOME/repo"
+if [ ! -d "$REPO_DIR/.git" ]; then
+  log "self-mod repo: cloning $REPO_URL → $REPO_DIR"
+  if git clone "$REPO_URL" "$REPO_DIR" >/dev/null 2>&1; then
+    log "self-mod repo: cloned"
+  else
+    warn "self-mod repo: clone failed — agent source edits disabled"
+  fi
+else
+  if ( cd "$REPO_DIR" && git fetch origin main >/dev/null 2>&1 ); then
+    log "self-mod repo: fetched origin/main"
+  else
+    warn "self-mod repo: fetch failed"
+  fi
 fi
 
 # ── (4) dsh web — the fleet manager agent, FOREGROUND (its death = container death) ──
