@@ -61,11 +61,21 @@ jobs:
               service: http://localhost:8080
             - service: http_status:404
           EOF
-          sudo nohup cloudflared tunnel --no-autoupdate --config /root/.cloudflared/config.yml run >/tmp/cloudflared.log 2>&1 &
-          sleep 15
+          sudo tee /usr/local/bin/cloudflared-loop >/dev/null <<'LOOP'
+          #!/usr/bin/env bash
+          while true; do
+            cloudflared tunnel --no-autoupdate --config /root/.cloudflared/config.yml run
+            rc=$?
+            echo "[cloudflared-loop $(date -u +%H:%M:%S)] cloudflared exited rc=$rc — restarting in 5s" >> /tmp/cloudflared.log
+            sleep 5
+          done
+          LOOP
+          sudo chmod +x /usr/local/bin/cloudflared-loop
+          sudo nohup /usr/local/bin/cloudflared-loop >/tmp/cloudflared.log 2>&1 &
+          sleep 20
           echo "---- cloudflared log ----"
           tail -n 30 /tmp/cloudflared.log
-          echo "tunnel start requested"
+          echo "tunnel start requested (auto-restart loop)"
 
       - name: Keep alive
         run: |
