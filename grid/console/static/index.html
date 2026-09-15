@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>grid/autonomy — mission console</title>
+  <title>grid fleet — mission console</title>
   <meta name="description" content="Observation, configuration and dev control for the standalone freqtrade dry-run grid-trading fleet.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -17,7 +17,7 @@
 <header class="topbar">
   <div class="topbar-row">
     <div class="brand">
-      <span class="brand-title">grid<span class="slash">/</span>autonomy</span>
+      <span class="brand-title">grid<span class="slash">/</span>fleet</span>
       <span class="brand-sub" id="mission-sub" title="Active execution backend (state/engine.json). The standalone mission runs on the freqtrade dry-run engine; the WunderTrading paper engine was retired 2026-09-15.">mission console · freqtrade dry-run · engine: …</span>
     </div>
     <div class="statusbar" id="statusbar" aria-live="polite">
@@ -133,8 +133,6 @@
     <p></p>
     <div class="card" id="opt-data-sources"></div>
     <p></p>
-    <div class="card" id="opt-trackers"></div>
-    <p></p>
     <div class="card" id="opt-swaps"></div>
     <p></p>
     <div id="opt-banner"></div>
@@ -174,7 +172,6 @@
       <span class="sub">Closed round-trips per regime archetype gate the sizing ladder: base &lt;10 samples → probe ≥10 → full ≥30 &amp; PF ≥1.3; recent PF &lt;1.0 kills the archetype.</span>
     </div>
     <div class="view-head"><span class="sub">Aggregates are computed live from the dry-run fleet's trades DBs (M4 pairing → ledger math) — samples are closed grid round-trips only; there are no synthetic seeds and no WT-era pollution in the primary table.</span></div>
-    <div class="banner-slot" id="rel-freshness"></div>
     <div id="rel-note"></div>
     <div class="card"><div class="card-body--tight table-wrap">
       <table class="ledger">
@@ -263,7 +260,7 @@
     <div class="logbox" id="logbox" tabindex="0">—</div>
   </section>
 
-  <p class="footer-note" id="footnote">grid/autonomy console · freqtrade dry-run · 127.0.0.1</p>
+  <p class="footer-note" id="footnote">grid fleet console · freqtrade dry-run · 127.0.0.1</p>
 </main>
 
 <div id="modal-root"></div>

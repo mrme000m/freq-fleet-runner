@@ -1,4 +1,4 @@
-/* grid/autonomy console — vanilla JS, no build step.
+/* grid fleet console — vanilla JS, no build step.
    Polls the console backend (same origin), renders the fleet, ledger,
    run cards, reliability, config editor and logs. */
 
@@ -261,16 +261,19 @@ function freshnessBadge(f) {
     age < 86400 ? `${Math.round(age/3600)}h ago` :
     `${Math.round(age/86400)}d ago`;
   const atStr = f.at_iso ? String(f.at_iso).slice(0, 19).replace("T", " ") + "Z" : "—";
-  // The brain was closed at 2026-09-14T21:42:37Z (state/engine.json
-  // since timestamp). Anything written before that instant is a frozen
-  // snapshot from the WT-era brain. config.yaml is intentionally
-  // exempt — it's still the authoritative wiring even if pre-pivot.
-  const pivotEpoch = Date.UTC(2026, 8, 14, 21, 42, 37);  // 2026-09-14T21:42:37Z
+  // Server verdict first: _freshness() computes `frozen`/`frozen_at` from
+  // state/engine.json's live `since` epoch, which MOVES when the engine
+  // declaration is rewritten (the 2026-09-15 lower-TF reset bumped it to
+  // 09:31Z). The hardcoded epoch below is only the fallback for freshness
+  // blocks the server doesn't flag (e.g. the logs pane).
   const kind = f.kind || "state file";
   const isConfig = /config\.yaml$/i.test(f.path || "") || /config/i.test(kind);
-  const predatesPivot = !isConfig &&
-    (typeof f.at === "number") && (f.at * 1000) < pivotEpoch;
-  return { ageStr, atStr, predatesPivot, kind,
+  const predatesPivot = !isConfig && (typeof f.frozen === "boolean"
+    ? f.frozen
+    : (typeof f.at === "number") &&
+      (f.at * 1000) < Date.UTC(2026, 8, 14, 21, 42, 37));
+  const frozenDate = String(f.frozen_at || "2026-09-14").slice(0, 10);
+  return { ageStr, atStr, predatesPivot, kind, frozenDate,
           path: f.path || "" };
 }
 
@@ -285,7 +288,7 @@ function renderFreshnessBanner(slotId, freshness) {
       <div>
         <div class="banner-title">Stale snapshot — brain closed</div>
         This ${esc(b.kind)} was last written <b>${esc(b.atStr)}</b>
-        (${esc(b.ageStr)}), before the WT-era pivot on 2026-09-14. The autonomy
+        (${esc(b.ageStr)}), before the engine epoch on ${esc(b.frozenDate)}. The autonomy
         loop is closed in this workspace — no new entries will appear until
         M3 lands. The rows below are a frozen snapshot from the last WT-era
         deliberation cycle.
@@ -352,9 +355,10 @@ function renderStatusbar(ov) {
   }
   const ftf = ov.ft_fleet || {};
   const insts = ftf.instances || [];
-  const running = insts.filter((i) => i.api_ok).length;
+  const running = insts.filter((i) => i.status === "running").length;
+  const starting = insts.filter((i) => i.status === "starting").length;
   const committed = insts.reduce((a, i) => a + (isNum(i.open_stake) ? Number(i.open_stake) : 0), 0);
-  chips.push(`<span class="chip"><span class="dot"></span>fleet <b>${running}/${ftf.active ?? running}</b> \u00b7 ${esc(fmtUsd(committed))} committed (dry-run)</span>`);
+  chips.push(`<span class="chip"><span class="dot"></span>fleet <b>${running}/${ftf.active ?? insts.length}</b>${starting ? ` \u00b7 ${starting} starting` : ""} \u00b7 ${esc(fmtUsd(committed))} committed (dry-run)</span>`);
   chips.push(d.kill_file
     ? `<span class="chip chip--bad"><span class="dot"></span><b>KILL armed</b></span>`
     : `<span class="chip"><span class="dot"></span>KILL clear</span>`);
@@ -373,9 +377,16 @@ function renderStatusbar(ov) {
 const chartCache = {};   // "venue:symbol:interval" -> {at (epoch ms), data}
 const CHART_TTL_MS = 5 * 60 * 1000;
 const chartInflight = {};   // same key -> promise, dedupes parallel polls
-let slotChartsBusy = false;
 
-async function fetchChart(venue, symbol, interval = "5m", bars = 96) {
+/* The interval every fleet sparkline + market modal fetches and reads
+   back from the cache. One constant on purpose: the 2026-09-15 lower-TF
+   reset moved the fleet to the 1m-5m band, the fetch default was bumped
+   to 5m, but the two cache READERS still looked up ":1h" — so
+   sparklines never painted and the modal always took the spinner path.
+   Everything derives from this so producer and consumers cannot drift. */
+const SPARK_INTERVAL = "5m";
+
+async function fetchChart(venue, symbol, interval = SPARK_INTERVAL, bars = 96) {
   const key = `${venue}:${symbol}:${interval}`;
   const hit = chartCache[key];
   if (hit && Date.now() - hit.at < CHART_TTL_MS) return hit.data;
@@ -394,27 +405,39 @@ async function fetchChart(venue, symbol, interval = "5m", bars = 96) {
   return chartInflight[key];
 }
 
-/* fetch /api/chart (1h × 96 bars) for each distinct venue:symbol on the
-   fleet in parallel; then paint whatever is cached. Fail-soft: a rejected
-   fetch keeps the previous sparkline / placeholder untouched. */
+/* fetch /api/chart for each distinct venue:symbol on the fleet and paint
+   each sparkline the moment its own data lands. Fail-soft: a rejected
+   fetch keeps the previous sparkline / placeholder untouched — and a
+   single symbol with no upstream feed (HYPE has no Binance TV pair) gets
+   an honest "no market feed" note instead of holding the whole board
+   hostage until a 30s tvcli timeout lets an await-all through. */
 async function loadSlotCharts(ov) {
-  if (slotChartsBusy) return;
-  slotChartsBusy = true;
-  try {
-    const seen = new Set();
-    const jobs = [];
-    const sources = [...(ov.bots || []),
-                     ...(((ov.ft_fleet || {}).instances) || [])];
-    for (const b of sources) {
-      if (!b || !b.venue || !b.symbol) continue;
-      const key = `${b.venue}:${b.symbol}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      jobs.push(fetchChart(b.venue, b.symbol));
+  const seen = new Set();
+  const sources = [...(ov.bots || []),
+                   ...(((ov.ft_fleet || {}).instances) || [])];
+  for (const b of sources) {
+    if (!b || !b.venue || !b.symbol) continue;
+    const key = `${b.venue}:${b.symbol}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    fetchChart(b.venue, b.symbol)
+      .then(() => renderSlotSparklines())
+      .catch(() => markSparkFeedless(key));
+  }
+  renderSlotSparklines();   // paint whatever is already cached
+}
+
+/* honest placeholder for a symbol the chart source cannot serve — the
+   slot keeps its live channel overlay available via the card rows, and
+   a later successful poll repaints the sparkline over this note. */
+function markSparkFeedless(key) {
+  for (const node of document.querySelectorAll(".slot-spark")) {
+    if (node.dataset.key !== key) continue;
+    const slot = node.querySelector(".spark-slot");
+    if (slot && !slot.querySelector(".spark-svg")) {
+      slot.innerHTML = `<div class="empty-note" style="padding:10px 4px">no market feed — tvcli has no Binance pair for ${esc(key.split(":")[1] || key)}</div>`;
     }
-    await Promise.allSettled(jobs);
-    renderSlotSparklines();
-  } finally { slotChartsBusy = false; }
+  }
 }
 
 /* inline sparkline per .slot-spark node: closes min-max scaled (3px pad),
@@ -425,7 +448,7 @@ function renderSlotSparklines() {
   const bots = (lastOverview && lastOverview.bots) || [];
   for (const node of document.querySelectorAll(".slot-spark")) {
     const key = node.dataset.key || "";
-    const hit = chartCache[`${key}:1h`];
+    const hit = chartCache[`${key}:${SPARK_INTERVAL}`];
     if (!hit || !hit.data) continue;
     const bars = hit.data.bars || [];
     if (bars.length < 2) continue;
@@ -479,7 +502,7 @@ function renderSlotSparklines() {
   }
 }
 
-/* the big chart modal: 96×1h closes as a line + light area fill, dashed
+/* the big chart modal: 96 closes as a line + light area fill, dashed
    channel high/mid/low with right-edge labels, lo/hi/last captions and
    the bar window. Reuses #modal-root; Escape/backdrop/Close all clean
    the key listener up (confirmDialog's onKey pattern).
@@ -508,7 +531,7 @@ function openMarketModal(key, slot) {
       el("button", { class: "btn", onclick: () => done() }, "Close")));
   const chartHost = modal.querySelector(".mk-chart");
 
-  function paint(bars) {
+  function paint(bars, interval = SPARK_INTERVAL) {
     let ch = null;
     const insts = (((lastOverview && lastOverview.ft_fleet) || {}).instances) || [];
     const inst = insts.find((x) => `ft:${x.bot_code}` === String(slot));
@@ -549,7 +572,7 @@ function openMarketModal(key, slot) {
         if (ch) refs = chLine(ch.high, "hi") + chLine(ch.mid, "mid") + chLine(ch.low, "lo");
         chartHTML = `
           <svg class="mk-svg" viewBox="0 0 ${W.toFixed(0)} ${H}" role="img"
-               aria-label="1h closes for ${esc(venue)}:${esc(symbol)}">
+               aria-label="${esc(interval)} closes for ${esc(venue)}:${esc(symbol)}">
             <path class="mk-area${up ? "" : " mk-area--down"}" d="${area}"/>
             ${refs}
             <polyline class="mk-line${up ? "" : " mk-line--down"}" points="${pts.trim()}"/>
@@ -562,7 +585,7 @@ function openMarketModal(key, slot) {
             <span>last <b>${fmtPrice(last)}</b></span>
             <span class="mk-delta ${up ? "mk-delta--up" : "mk-delta--down"}">
               \u0394 ${up ? "+" : "\u2212"}${Math.abs(first ? ((last - first) / first) * 100 : 0).toFixed(2)}%</span>
-            <span class="mk-window">${bars.length} \u00d7 1h bars \u00b7 ${relTimeEpoch(t0)} \u2192 ${relTimeEpoch(tN)}</span>
+            <span class="mk-window">${bars.length} \u00d7 ${esc(interval)} bars \u00b7 ${relTimeEpoch(t0)} \u2192 ${relTimeEpoch(tN)}</span>
           </div>`;
       }
     }
@@ -570,25 +593,26 @@ function openMarketModal(key, slot) {
   }
 
   // First paint from the cache; if cold, request a fetch + show a spinner.
-  const cached = chartCache[`${key}:1h`];
+  const cached = chartCache[`${key}:${SPARK_INTERVAL}`];
   const cachedBars = (cached && cached.data && cached.data.bars) || [];
   if (cachedBars.length >= 2) {
-    paint(cachedBars);
+    paint(cachedBars, (cached && cached.data && cached.data.interval) || SPARK_INTERVAL);
   } else {
-    chartHost.innerHTML = `<div class="mk-empty"><span class="spinner"></span> fetching ${esc(venue)}:${esc(symbol)} 5m bars…</div>`;
+    chartHost.innerHTML = `<div class="mk-empty"><span class="spinner"></span> fetching ${esc(venue)}:${esc(symbol)} ${SPARK_INTERVAL} bars\u2026</div>`;
     // Fire (or wait on an in-flight) fetch with a bounded timeout — never
     // strand the operator on a spinner if tvcli is down.
     let timer;
     const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("timeout")), 12000); });
-    const work = fetchChart(venue, symbol, "5m", 96)
-      .then((d) => (d && d.bars) || [])
-      .catch(() => null);
-    Promise.race([work, timeout]).then((bars) => {
+    const work = fetchChart(venue, symbol, SPARK_INTERVAL, 96)
+      .then((d) => d || {})
+      .catch(() => ({}));
+    Promise.race([work, timeout]).then((d) => {
       clearTimeout(timer);
       // If the user closed the modal in the meantime, chartHost is no
       // longer in the DOM — skip the second paint.
       if (!chartHost.isConnected) return;
-      paint(bars && bars.length >= 2 ? bars : []);
+      const bars = (d && d.bars) || [];
+      paint(bars.length >= 2 ? bars : [], d.interval || SPARK_INTERVAL);
     });
   }
 
@@ -693,7 +717,7 @@ function instanceCardHTML(i) {
   const realized = Number(i.realized || 0);
   const row = (k, v) => `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
   const rows = [
-    row("pair", `<span class="mono">${esc(i.pair || "?")} · 1h · :${esc(i.port ?? "?")}</span>`),
+    row("pair", `<span class="mono">${esc(i.pair || "?")} · ${esc(i.timeframe || "—")} · :${esc(i.port ?? "?")}</span>`),
     row("wallet", i.wallet_total != null
       ? `<span class="mono">${fmtUsd(i.wallet_total)} USDC</span> <span class="badge badge--dim" title="freqtrade dry_run wallet — virtual funds only, dry_run: true is hardcoded in the instance config">dry-run</span>`
       : "—"),
@@ -707,14 +731,26 @@ function instanceCardHTML(i) {
       ? `<span class="mono">${fmtNum(ch.low, 0)} \u2013 ${fmtNum(ch.high, 0)} · step ${fmtNum(ch.step_pct, 2)}% · ${ch.grids} lines</span> <span class="badge badge--dim" title="recomputed live from the engine's last analyzed candle — GridStrategy never persists geometry">live</span>`
       : "computing\u2026"),
   ].join("");
-  const spark = `<div class="slot-spark" data-key="${esc(i.venue || "")}:${esc(i.symbol || "")}" data-slot="ft:${esc(i.bot_code)}" title="1h \u00d7 96 closes (tvcli market data)">
+  const spark = `<div class="slot-spark" data-key="${esc(i.venue || "")}:${esc(i.symbol || "")}" data-slot="ft:${esc(i.bot_code)}" title="${SPARK_INTERVAL} × 96 closes (tvcli market data)">
     <div class="spark-slot"><div class="empty-note" style="padding:10px 4px">chart loading\u2026</div></div>
     <div class="spark-delta mono"></div></div>`;
+  /* Live status: server-derives running (pid alive + REST ok) / starting
+     (pid alive, REST warming up or in back-off) / down (pid gone). The old
+     api_ok-only badge painted a warming-up or 429-backing-off engine as
+     "down". */
+  const stTitle = i.api_backoff
+    ? "engine REST in short back-off after a failed probe (429 storm / warm-up) — marks refresh when it clears"
+    : "pid alive + engine REST probe ok";
+  const stBadge = i.status === "running"
+    ? `<span class="badge badge--ok" title="${stTitle}">running</span>`
+    : i.status === "starting"
+    ? `<span class="badge badge--warn" title="${stTitle}">starting</span>`
+    : `<span class="badge badge--bad" title="engine process not running">down</span>`;
   return `
     <div class="slot-head">
       <span class="venue-tag venue-tag--${esc(i.venue || "hyperliquid")}">${esc(i.venue || "?")}</span>
       <b class="mono">${esc(i.bot_code)}</b>
-      <span class="badge ${i.api_ok ? "badge--ok" : "badge--bad"}">${i.api_ok ? "running" : "down"}</span>
+      ${stBadge}
       <span class="badge badge--violet" title="freqtrade dry-run — virtual funds only; nothing in this workspace can place a live order">DRY-RUN</span>
     </div>
     ${spark}
@@ -738,7 +774,7 @@ function renderFleetInstances(instances, board) {
     const key = `ft:${i.bot_code}`;
     targetKeys.push(key);
     let node = have.get(key);
-    const sig = [i.api_ok, i.wallet_total, i.open_trades, i.open_profit_abs,
+    const sig = [i.status, i.api_ok, i.wallet_total, i.open_trades, i.open_profit_abs,
                  i.open_profit_pct, i.open_enter_tag, i.realized,
                  i.closed_trades, i.fills, i.fills_24h, i.last_fill_at,
                  i.started_at, i.channel_live && i.channel_live.grids,
@@ -783,6 +819,7 @@ function renderFleet(ov) {
 /* Fleet banner strip — engine declaration + mission state + lifecycle
    buttons. Shared by the standalone board and the WT-era fallback. */
 function _renderFleetBanners(ov) {
+  _refreshTunedParams();   // 60s-throttled; the dry-run banner reads it
   const banners = [];
   const d = ov.daemon || {};
   const eng = ov.engine || null;
@@ -809,8 +846,16 @@ function _renderFleetBanners(ov) {
       <div><div class="banner-title">KILL file armed</div>The daemon halts at the next loop tick. Clear it to keep the fleet running.</div>
       <button class="btn" id="b-unkill" style="margin-left:auto">Clear KILL</button></div>`);
   } else if (d.mode === "dry-run") {
+    // tuned params are fetched from /api/optimizer on the first banner
+    // build (60s cache); if not yet available, fall back to a generic line
+    // — never hardcode numbers (the M5 pass bumped step_factor from 0.21
+    // to 1.0; a hardcoded string here lies to operators).
+    const tp = _tunedBannerParams;
+    const tpLine = tp
+      ? `The grid_geometry channel is computed live from the ATR (tuned params band_atr ${tp.band_atr} / step_factor ${tp.step_factor}${tp.min_atr_pct != null ? ` / min_atr_pct ${tp.min_atr_pct}` : ""}).`
+      : `The grid_geometry channel is computed live from the ATR.`;
     banners.push(`<div class="banner banner--info">
-      <div><div class="banner-title">Dry-run mode</div>The freqtrade engine is trading with virtual funds on the configured pair — no real orders. The grid_geometry channel is computed live from the ATR (tuned params band_atr 4.2 / step_factor 0.21).</div>
+      <div><div class="banner-title">Dry-run mode</div>The freqtrade engine is trading with virtual funds on the configured pair — no real orders. ${tpLine}</div>
       <button class="btn" id="b-restart" style="margin-left:auto;flex:none">Restart mission</button></div>`);
   }
   const bn = $("#fleet-banner");
@@ -822,6 +867,29 @@ function _renderFleetBanners(ov) {
 }
 
 let feedSig = "";
+let _tunedBannerParams = null;     // band_atr / step_factor / min_atr_pct
+let _tunedBannerAt = 0;            // epoch s — 60s cache
+function _refreshTunedParams() {
+  // Lazy: the banner copy reads these; one shot per minute is enough.
+  // /api/optimizer nests them under .fast.tuned_params.params.buy
+  // (the slow-loop payload is `applicable:false` here — see the engine
+  // note — but the fast geom pass always carries the tuned params).
+  const now = Math.floor(Date.now() / 1000);
+  if (_tunedBannerParams && now - _tunedBannerAt < 60) return;
+  api("/api/optimizer").then((d) => {
+    const buy = ((((d || {}).fast || {}).tuned_params || {}).params || {}).buy || {};
+    // Accept only a complete read — a half-loaded payload must never
+    // paint "band_atr undefined / step_factor undefined" into the banner.
+    if (isNum(buy.band_atr) && isNum(buy.step_factor)) {
+      _tunedBannerParams = {
+        band_atr: Number(buy.band_atr),
+        step_factor: Number(buy.step_factor),
+        min_atr_pct: isNum(buy.min_atr_pct) ? Number(buy.min_atr_pct) : null,
+      };
+      _tunedBannerAt = now;
+    }
+  }).catch(() => { /* keep last value */ });
+}
 function renderFeed(journal) {
   const feed = $("#feed");
   const rows = [...journal].reverse().slice(0, 60); // newest first
@@ -910,8 +978,8 @@ const ftf = ov.ft_fleet || {};
     ${dryRunLine}
     <div class="row"><span class="k">Mode</span><span class="v">${esc(d.mode || "—")}${d.supervisor === "grid/dev" ? " · grid/dev" : d.supervisor ? ` · ${esc(d.supervisor)}` : ""}</span></div>
     <div class="row"><span class="k">Archetypes tracked</span><span class="v">${Object.keys((ov.reliability || {}).archetypes || {}).length}</span></div>
-    <div class="row"><span class="k">Pair</span><span class="v">${active.length ? esc(active[0].pair || "—") : "—"}</span></div>
-    <div class="row"><span class="k">Engine uptime</span><span class="v">${active.length ? `${active.length} running` : "0"}</span></div>`;
+    <div class="row"><span class="k">Pairs</span><span class="v">${active.length ? active.map((i) => esc(i.pair || "—")).join(" · ") : "—"}</span></div>
+    <div class="row"><span class="k">Engines running</span><span class="v">${active.length} / ${(ftf.instances || []).length}</span></div>`;
 }
 
 /* Fleet PnL header — hero + cells + timeline, derived live from the
@@ -935,7 +1003,7 @@ function renderFleetHeader(ov) {
   const wallets = insts.map((i) => num(i.wallet_total)).filter((v) => v !== null);
   p.total = wallets.length ? wallets.reduce((a, v) => a + v, 0) : null;
   p.idle = p.total != null ? p.total - p.committed : null;
-  const nBots = insts.filter((i) => i.api_ok).length;
+  const nBots = insts.filter((i) => i.status === "running").length;
 
   const netCls = p.net == null ? "m-value--dim" : p.net > 0 ? "m-value--good" : p.net < 0 ? "m-value--bad" : "m-value--dim";
   const idlePct = (p.idle == null || !p.total) ? null : (p.idle / p.total) * 100;
@@ -943,7 +1011,7 @@ function renderFleetHeader(ov) {
 
   let capCell;
   if (nBots) {
-    const i0 = insts.find((i) => i.api_ok);
+    const i0 = insts.find((i) => i.status === "running");
     capCell = `<div class="pnl-cell" title="one dry-run freqtrade instance per grid bot \u00b7 no platform cap applies locally">
       <div class="m-label">freqtrade engine</div>
       <div class="m-value">${nBots} running${i0 && i0.pair ? ` \u00b7 ${esc(i0.pair)}` : ""}</div>
@@ -1145,10 +1213,13 @@ function renderEngineSession(eng) {
   const rows = eng.instances.map((i) => {
     const ch = i.channel || {};
     const mark = isNum(i.open_profit_abs) ? Number(i.open_profit_abs) : null;
+    const st = i.status === "running" ? `<span class="badge badge--ok">running</span>`
+      : i.status === "starting" ? `<span class="badge badge--warn">starting</span>`
+      : `<span class="badge badge--bad">down</span>`;
     return `<tr>
       <td class="td-mono"><b>${esc(i.bot_code || "?")}</b></td>
       <td class="td-mono">${esc(i.pair || "?")}</td>
-      <td><span class="badge ${i.api_ok ? "badge--ok" : "badge--bad"}">${i.api_ok ? "running" : "down"}</span></td>
+      <td>${st}</td>
       <td class="td-mono">${i.open_trades ?? 0} open · ${i.closed_trades ?? 0} closed · ${i.fills ?? 0} fills</td>
       <td class="td-mono">mark <b class="${mark != null ? (mark >= 0 ? "m-value--good" : "m-value--bad") : "m-value--dim"}">${mark != null ? fmtSignedUsd(mark) : "\u2014"}</b> · realized ${fmtSignedUsd(Number(i.realized || 0))}</td>
       <td class="td-mono">${ch.low != null ? `${fmtNum(ch.low, 0)}\u2013${fmtNum(ch.high, 0)} · ${ch.grids} lines · step ${fmtNum(ch.step_pct, 2)}%` : "\u2014"}</td>
@@ -1278,11 +1349,6 @@ function renderStandaloneOptimizer(d) {
       </div>`;
   }
 
-  const trackersEl = $("#opt-trackers");
-  if (trackersEl) {
-    trackersEl.innerHTML = "";
-  }
-
   const swapsEl = $("#opt-swaps");
   if (swapsEl) {
     swapsEl.innerHTML = `
@@ -1301,7 +1367,7 @@ function renderStandaloneOptimizer(d) {
   const pendingBody = document.querySelector("#opt-pending-body");
   const appliedBody = document.querySelector("#opt-applied-body");
   if (pendingBody) pendingBody.innerHTML = `<tr><td colspan="9" class="empty-note" style="padding:14px;">Not applicable: GridStrategy recomputes the channel every candle inside the strategy; there is no separate slow-loop apply queue in this workspace.</td></tr>`;
-  if (appliedBody) appliedBody.innerHTML = `<tr><td colspan="9" class="empty-note" style="padding:14px;">—</td></tr>`;
+  if (appliedBody) appliedBody.innerHTML = `<tr><td colspan="8" class="empty-note" style="padding:14px;">—</td></tr>`;
   const pendingCount = document.querySelector("#opt-pending-count");
   const appliedCount = document.querySelector("#opt-applied-count");
   if (pendingCount) pendingCount.textContent = "n/a";
@@ -1865,18 +1931,19 @@ async function loadLogs(force = false) {
     }
     if (data.source) logPath.title = `source: ${data.source}`;
   }
-  // Workspace-tail (no WT-era daemon): show a banner explaining the merge +
-  // a freshness block listing the per-source last-written age.
+  // Workspace-tail (no WT-era daemon): one freshness banner dated by the
+  // newest source file's server-reported mtime. The previous code parsed
+  // the PATH STRING as a date (`new Date(s.path)`), got NaN → -Infinity,
+  // and mislabeled this LIVE pane as a frozen pre-pivot snapshot.
   if (data.source === "workspace-tail") {
     const sources = data.sources || [];
-    const rows = sources.map((s) => {
-      const age = (() => { try { return Math.round((Date.now() - s.path.__mtime)/1000); } catch(_) { return null; } })();
-      return `<tr><td class="td-mono">${esc(s.label)}</td><td class="td-mono">${esc(s.path)}</td></tr>`;
-    }).join("");
+    const mtimes = sources.map((s) => Number(s && s.mtime))
+      .filter((t) => isFinite(t) && t > 0);
+    const newest = mtimes.length ? Math.max(...mtimes) : null;
     renderFreshnessBanner("log-freshness", {
-      at: Math.max(...sources.map((s) => { try { return new Date(s.path).getTime() / 1000; } catch(_) { return null; } }).filter(Boolean)),
-      at_iso: new Date().toISOString(),
-      age_s: 0,
+      at: newest,
+      at_iso: newest ? new Date(newest * 1000).toISOString() : null,
+      age_s: newest ? Math.max(0, Math.round(Date.now() / 1000 - newest)) : null,
       path: sources.map((s) => s.path).join(" + "),
       kind: "workspace-tail (live log merge)",
       note: data.note,
@@ -2034,9 +2101,10 @@ async function ctlStart(livePaper) {
     title: isDryRun ? "Start mission (dry-run)" : "Start mission",
     body: [el("div", {},
       isDryRun
-        ? "Boots the mission console (:8798) and the freqtrade dry-run engine (grid/dev). " +
-          "GridStrategy on BTC/USDC:USDC 1h, Hyperliquid public data. No real orders — " +
-          "the instance config hardcodes dry_run: true."
+        ? "Boots the mission console (:8798) and the freqtrade dry-run fleet (grid/dev). "
+          + "GridStrategy slots on the 1m-5m band (BTC 1m · ETH/SOL 3m · HYPE 5m), "
+          + "Hyperliquid public data. No real orders — dry_run: true is hardcoded "
+          + "in every instance config."
         : (livePaper
             ? "Legacy WT-era mode is retired; this workspace is dry-run only."
             : "Plans and journals everything, creates nothing."))],
@@ -2133,7 +2201,7 @@ async function boot() {
       ? `mission console · engine: ${eng.engine}${eng.mode ? ` (${eng.mode})` : ""} · daemon: ${modeLabel}`
       : `mission console · ${modeLabel} · connecting…`;
     $("#footnote").textContent =
-      `grid/autonomy console · ${modeLabel} · console :${meta.console_port} · supervisor ${meta.supervisor} · pb ${meta.pocketbase.replace("http://", "")}`;
+      `grid fleet console · ${modeLabel} · console :${meta.console_port} · supervisor ${meta.supervisor} · pb ${meta.pocketbase.replace("http://", "")}`;
   } catch { /* header/footnote stay default */ }
 }
 boot();

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""console — observation + configuration + dev-control backend for grid-autonomy.
+"""console — observation + configuration + dev-control backend for the
+standalone grid fleet.
 
-A separate, additive HTTP service (the daemon itself is untouched): it reads
-the daemon's state artifacts (state.json, decisions.jsonl, reliability.json,
-reports/, daemon.log), proxies the daemon's ctl plane (:8799), and adds the
-operations the ctl plane deliberately lacks — whitelisted config.yaml edits
-(comment-preserving), KILL-file management, and daemon lifecycle control
-(launchd-aware start/stop/restart). Serves the static frontend from ./static.
+A separate, additive HTTP service: it reads the workspace state artifacts
+(state.json, decisions.jsonl, reliability.json, reports/), serves the live
+freqtrade fleet (registry + engine REST + trades DBs), and adds the
+operations the ctl plane deliberately lacked — whitelisted config.yaml edits
+(comment-preserving), KILL-file management, and stack lifecycle control via
+grid/dev. Serves the static frontend from ./static. The WT-era daemon ctl
+plane (:8799) is RETIRED in this workspace — see CTL_RETIRED below.
 
 Bindings: 127.0.0.1 only. Destructive calls require {"confirm": true}.
 Stdlib only, like the rest of grid-autonomy.
@@ -27,33 +29,33 @@ API (all JSON):
     GET  /api/recommendations?limit=  position-optimizer recommendations
                               (PocketBase records, newest first)
     GET  /api/screen          latest rescreen run card extract
-    GET  /api/optimizer        proxy of the fast slot-optimizer status
-                              (ctl /optimizer; fail-soft:
-                              {"optimizer": null, "error": ...} + 200
-                              when down)
+    GET  /api/optimizer        standalone payload — the WT-era slow-loop
+                              optimizer has no freqtrade counterpart
+                              (applicable:false + live geometry, tuned
+                              params, M4 ledger, decision tail)
     GET  /api/optimizer/swap-log  swap_log + per-slot idle trackers +
                               last arbiter verdict from state.optimizer
-                              (no ctl round-trip; fail-soft empty)
-    GET  /api/reports         run-card index
+                              (fail-soft empty)
+    GET  /api/reports         run-card index + live engine session
     GET  /api/reports/<stem>  one run card {json, md}
-    GET  /api/logs?lines=&grep=  daemon.log tail
+    GET  /api/logs?lines=&grep=  log tail — workspace-tail merges every
+                              live log (state/logs/* + per-engine logs)
     GET  /api/config          parsed config.yaml + editable whitelist
-    GET  /api/observe         proxy of the daemon ctl /observe (5s cache,
-                              fail-soft: {"error": ...} + 200 when down)
-    GET  /api/status          proxy of the daemon ctl /status  (5s cache,
-                              fail-soft: {"error": ...} + 200 when down)
-    GET  /api/pnl             PnL history — PocketBase `journal` records of
-                              kind "pnl-snapshot" (via the pbclient adapter
-                              with .pocketbase/pb.env superuser re-auth,
-                              then the raw HTTP read, falling back to
-                              state.json's journal array)
+    GET  /api/observe         daemon ctl proxy — RETIRED (fail-soft error)
+    GET  /api/status          daemon ctl proxy — RETIRED (fail-soft error)
+    GET  /api/pnl             PnL history — post-pivot PocketBase journal
+                              rows when present, else one merged fleet
+                              timeline from the dry-run trades DBs
+                              (cumulative realized + live open-position
+                              mark)
                               → {points: [{at, fleet{…}}]} newest-first
     GET  /api/chart?venue=&symbol=&interval=&bars=
                               OHLCV window for a slot's market — proxy of
                               the tvcli server's POST /fetch (interval ∈
-                              15m|1h|4h|1d, bars 8..500, 60s in-process
-                              cache; fail-soft: {"error": …, "bars": []}
-                              + 200 when tvcli is down)
+                              1m|3m|5m|15m|1h|4h|1d, bars 8..500, 60s
+                              in-process cache; fail-soft:
+                              {"error": …, "bars": []} + 200 when tvcli
+                              is down)
                               → {at, venue, symbol, interval,
                                  bars: [{t, o, h, l, c}] oldest-first}
     GET  /api/position-sweeps position-optimizer sweep history — journal
@@ -64,19 +66,18 @@ API (all JSON):
     GET  /api/meta            ports, paths, versions
     GET  /api/llm/health      live provider ping + role routing matrix
                               (60s in-process cache; keys never returned)
-    POST /api/ctl/rescreen    queue an immediate rescreen     {confirm}
-    POST /api/ctl/optimize    queue an immediate fast-optimizer
-                              cycle                        {confirm}
-    POST /api/ctl/reliability queue a reliability refresh     {confirm}
-    POST /api/ctl/rotate      force-rotate a slot {slot}     {confirm}
+    POST /api/ctl/rescreen    RETIRED — the standalone workspace has no
+    POST /api/ctl/optimize    daemon ctl plane; these return 502 (the
+    POST /api/ctl/reliability freqtrade engine + GridStrategy own the
+    POST /api/ctl/rotate      loop, nothing to queue into)
     POST /api/ctl/kill        write the KILL file            {confirm}
     POST /api/ctl/unkill      remove the KILL file           {confirm}
     POST /api/config          apply whitelisted edits {edits:{path:value}}
-    POST /api/daemon/stop     KILL + SIGTERM (+SIGKILL w/ force) {confirm}
-    POST /api/daemon/start    scripts/start.sh [--live-paper]   {confirm,
-                              live_paper, clear_kill}
-    POST /api/daemon/restart  launchd kickstart or stop+start   {confirm,
-                              clear_kill, live_paper}
+    POST /api/daemon/stop     stop the stack via grid/dev   {confirm, force}
+    POST /api/daemon/start    grid/dev start [--no-ft]       {confirm,
+                              live_paper (ignored), clear_kill}
+    POST /api/daemon/restart  grid/dev stop+start            {confirm,
+                              clear_kill, live_paper (ignored)}
     POST /api/dev/reset       run `dev reset` (detached; wipes runtime
                               state, stops the stack; --keep-decisions /
                               --wt / --start)   {confirm, keep_decisions,
@@ -348,7 +349,27 @@ def _http_json(url, timeout=3.0, method="GET", body=None):
         return False, str(exc)[:200]
 
 
+# ── daemon ctl plane (:8799) — RETIRED in this workspace ────────────────
+# The WT-era brain this proxy used to drive was closed at the 2026-09-14
+# pivot (state/engine.json → legacy.closed_at), and nothing in the
+# standalone stack serves :8799. The M3 companion repo's daemon DOES
+# (different workspace, cwd .../grid-autonomy) and it answers with the
+# legacy /status shape — so before this flag existed the console silently
+# fused to a FOREIGN system: /api/overview's readiness probe rendered the
+# companion daemon's diagnostics as if they were ours, and POST
+# /api/ctl/kill would have armed THEIR halt instead of writing the local
+# KILL file. Every ctl call is therefore hard-disabled; the console stays
+# workspace-contained. Flip this only if a ctl plane ever ships INSIDE
+# grid/dev with its own port.
+CTL_RETIRED = True
+
+
 def _ctl(path, method="GET", body=None):
+    if CTL_RETIRED:
+        return False, {"error": "ctl retired — the standalone workspace "
+                                "has no daemon ctl plane (:8799 belongs "
+                                "to the M3 companion repo's daemon and is "
+                                "never read or driven from here)"}
     return _http_json(f"http://127.0.0.1:{_ctl_port()}{path}", 3.0, method, body)
 
 
@@ -539,52 +560,63 @@ def pnl_payload() -> dict:
                             "(workspace PocketBase :8290)"}
     except Exception:
         pass
-    # 2) live per-instance dry-run trades DBs + engine REST marks
-    points = []
+    # 2) live per-instance dry-run trades DBs + engine REST marks.
+    # ONE merged fleet timeline: every closed trade (from any instance)
+    # advances the fleet-wide cumulative realized, and a single trailing
+    # live point carries the fleet's realized total plus the sum of the
+    # open-position marks. The previous shape emitted one cumulative
+    # series PER BOT all under the same `fleet` key — the frontend chart
+    # plotted them as one line and sawtoothed between bots' own sums.
+    events = []          # (close_date, profit, bot_code) — raw db strings
+    fleet_unrealized = 0.0
+    has_live_mark = False
     for code, entry in (_ft_registry().get("instances") or {}).items():
         if not isinstance(entry, dict):
             continue
         db = os.path.join(entry.get("dir") or "", "tradesv3.dryrun.sqlite")
-        if not os.path.isfile(db):
-            continue
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        if os.path.isfile(db):
             try:
-                cur = con.cursor()
-                cur.execute("SELECT close_date, close_profit_abs FROM trades "
-                            "WHERE is_open=0 AND close_date IS NOT NULL "
-                            "ORDER BY close_date")
-                closed = cur.fetchall()
-            finally:
-                con.close()
-        except Exception:
-            continue
-        realized = 0.0
-        for at, profit in closed:
-            realized += float(profit or 0.0)
-            points.append({
-                "at": _iso_db_utc(at), "bot_code": code,
-                "fleet": {"realized": round(realized, 6),
-                          "unrealized": 0.0,
-                          "net": round(realized, 6)}})
+                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                try:
+                    cur = con.cursor()
+                    cur.execute("SELECT close_date, close_profit_abs FROM trades "
+                                "WHERE is_open=0 AND close_date IS NOT NULL "
+                                "ORDER BY close_date")
+                    events.extend(
+                        (at, float(profit or 0.0), code)
+                        for at, profit in cur.fetchall())
+                finally:
+                    con.close()
+            except Exception:
+                pass
         stats = _engine_instance_stats(entry)
         if stats["api_ok"] and stats["open_trades"]:
-            points.append({
-                "at": utcnow(), "bot_code": code, "live": True,
-                "fleet": {"realized": round(realized, 6),
-                          "unrealized": stats["open_profit_abs"] or 0.0,
-                          "net": round(realized
-                                       + (stats["open_profit_abs"] or 0.0),
-                                       6)}})
-    points.sort(key=lambda p: p.get("at") or "")
-    points = points[-200:]
+            fleet_unrealized += stats["open_profit_abs"] or 0.0
+            has_live_mark = True
+    events.sort(key=lambda e: e[0] or "")
+    points = []
+    realized = 0.0
+    for at, profit, code in events[-199:]:
+        realized += profit
+        points.append({
+            "at": _iso_db_utc(at), "bot_code": code,
+            "fleet": {"realized": round(realized, 6),
+                      "unrealized": 0.0,
+                      "net": round(realized, 6)}})
+    if has_live_mark:
+        points.append({
+            "at": utcnow(), "bot_code": "fleet", "live": True,
+            "fleet": {"realized": round(realized, 6),
+                      "unrealized": round(fleet_unrealized, 6),
+                      "net": round(realized + fleet_unrealized, 6)}})
     return {"points": list(reversed(points)),
             "source": "freqtrade-dryrun",
             "total": len(points),
-            "note": "realized accrues per closed dry-run trade; the trailing "
-                    "live point carries the open position's mark (engine "
-                    "REST). Written by nothing else — there is no WT-era "
-                    "snapshot in this feed."}
+            "note": "fleet-cumulative realized accrues per closed dry-run "
+                    "trade (any instance); the trailing live point carries "
+                    "the fleet's open-position mark (engine REST). Written "
+                    "by nothing else — there is no WT-era snapshot in "
+                    "this feed."}
 
 
 # ── market OHLCV proxy (tvcli /fetch) for slot sparklines ──────────────
@@ -651,10 +683,22 @@ def _chart_bars(venue: str, symbol: str, interval: str, bars) -> tuple[int, dict
     periods = body.get("periods") if ok and isinstance(body, dict) else None
     base = {"at": utcnow(), "venue": venue, "symbol": symbol,
             "interval": interval}
+
+    def _cache(payload):
+        # Cache FAILURES on the same 60s TTL as successes: a symbol with no
+        # upstream feed (e.g. HYPE has no Binance TV pair) must not re-hang
+        # tvcli for the full 30s timeout on every 5s console poll.
+        _CHART_CACHE[key] = (now + CHART_TTL, payload)
+        while len(_CHART_CACHE) > CHART_CACHE_MAX:
+            oldest = min(_CHART_CACHE, key=lambda k: _CHART_CACHE[k][0])
+            del _CHART_CACHE[oldest]
+
     if not isinstance(periods, list):
         err = body.get("error") if isinstance(body, dict) else None
-        return 200, {**base, "bars": [], "count": 0,
-                     "error": err or "tvcli unreachable"}
+        payload = {**base, "bars": [], "count": 0,
+                   "error": err or "tvcli unreachable"}
+        _cache(payload)
+        return 200, payload
     out = []
     for per in sorted(periods, key=lambda p: (p.get("time") or 0)
                       if isinstance(p, dict) else 0):
@@ -665,10 +709,7 @@ def _chart_bars(venue: str, symbol: str, interval: str, bars) -> tuple[int, dict
         except (KeyError, TypeError, ValueError):
             continue
     payload = {**base, "bars": out, "count": len(out)}
-    _CHART_CACHE[key] = (now + CHART_TTL, payload)
-    while len(_CHART_CACHE) > CHART_CACHE_MAX:
-        oldest = min(_CHART_CACHE, key=lambda k: _CHART_CACHE[k][0])
-        del _CHART_CACHE[oldest]
+    _cache(payload)
     return 200, payload
 
 
@@ -730,6 +771,12 @@ def _log_source() -> dict:
         except OSError:
             return False
 
+    def _mtime(path):
+        try:
+            return os.stat(path).st_mtime
+        except OSError:
+            return None
+
     if managed and _nonempty(LAUNCHD_LOG):
         return {"path": LAUNCHD_LOG, "source": "launchd",
                 "managed": True, "state_log": state_log}
@@ -743,14 +790,15 @@ def _log_source() -> dict:
         for name in sorted(os.listdir(log_dir)):
             p = os.path.join(log_dir, name)
             if os.path.isfile(p) and _nonempty(p):
-                sources.append({"path": p, "label": name, "kind": "console"})
+                sources.append({"path": p, "label": name, "kind": "console",
+                                "mtime": _mtime(p)})
     fleet_dir = os.path.join(STATE_DIR, "ft_fleet")
     if os.path.isdir(fleet_dir):
         for entry in sorted(os.listdir(fleet_dir)):
             p = os.path.join(fleet_dir, entry, "freqtrade.log")
             if os.path.isfile(p) and _nonempty(p):
                 sources.append({"path": p, "label": f"{entry}/freqtrade",
-                                "kind": "engine"})
+                                "kind": "engine", "mtime": _mtime(p)})
 
     if not sources:
         return {"path": state_log, "source": "state",
@@ -848,6 +896,23 @@ def ps_console_started_at(pid) -> float:
             return os.stat(_dev_script()).st_mtime
         except OSError:
             return time.time()
+
+
+def _pid_alive(pid: int) -> bool:
+    """True iff `pid` is a live process we can signal — used to derive
+    instance status (pid present + REST ok → running; pid present but no
+    REST yet → starting; pid gone → down). Returns False on bad input."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        # PermissionError means the process exists but isn't ours; in that
+        # rare case we still consider it alive.
+        return True
+    except OSError:
+        return False
 
 
 # ── domain shaping ─────────────────────────────────────────────────────
@@ -1940,7 +2005,7 @@ def engine_payload() -> dict | None:
 _FT_SAFE_FIELDS = (
     "bot_code", "dir", "port", "pair", "pair_code", "symbol", "venue",
     "exchange_code", "grid_type", "slot_balance", "channel", "created_at",
-    "pid", "status", "backend",
+    "pid", "status", "backend", "timeframe",
 )
 
 
@@ -1964,6 +2029,17 @@ def ft_fleet_payload() -> dict:
             # derived server-side; credentials never enter the payload.
             inst.update(_engine_instance_stats(e))
             inst["channel_live"] = _live_geometry(e)
+            # Derive status live — registry.json's "status" is a snapshot
+            # from registration time and never updates. The live signal is:
+            #   running   — pid is alive AND the engine REST probe succeeded
+            #   starting  — pid is alive but REST hasn't come up yet (warm-up)
+            #   down      — pid is gone
+            pid_alive = bool(e.get("pid")) and _pid_alive(e["pid"])
+            inst["status"] = (
+                "running" if pid_alive and inst.get("api_ok") else
+                "starting" if pid_alive else
+                "down"
+            )
             instances.append(inst)
     archived = [a for a in (reg.get("archived") or [])
                 if isinstance(a, dict)]
@@ -2034,14 +2110,20 @@ def _engine_rest(entry: dict, path: str, timeout: float = 2.5,
     credentials (HTTP Basic). Returns parsed JSON, or None on any failure.
     Credentials are used for the Authorization header only — never logged,
     never returned in any payload. Cached `ttl` seconds per instance+path;
-    after a failure the instance's REST calls back off for
-    _REST_COOLDOWN_S (see module note for the pool-exhaustion mechanism)."""
+    after a failure, REST calls for THAT instance+path back off for
+    _REST_COOLDOWN_S — keyed per endpoint, so one hung endpoint does not
+    wedge the rest of the instance's REST surface (see module note for the
+    pool-exhaustion mechanism)."""
     bot = str(entry.get("bot_code") or entry.get("port") or "?")
     now = time.time()
-    cd = _REST_COOLDOWN.get(bot)
+    # Per-(bot, path) cooldown: a single hung endpoint (e.g. /api/v1/balance
+    # on Hyperliquid when the exchange stub is slow) must not wedge other
+    # endpoints on the same instance — channel_live (pair_candles) still
+    # needs to render while /balance is in back-off.
+    key = (bot, path)
+    cd = _REST_COOLDOWN.get(key)
     if cd and cd > now:
         return None
-    key = (bot, path)
     hit = _REST_CACHE.get(key)
     if hit and hit[0] > now:
         return hit[1]
@@ -2054,7 +2136,7 @@ def _engine_rest(entry: dict, path: str, timeout: float = 2.5,
         with urllib.request.urlopen(req, timeout=timeout) as r:
             payload = json.loads(r.read() or b"{}")
     except Exception:
-        _REST_COOLDOWN[bot] = now + _REST_COOLDOWN_S
+        _REST_COOLDOWN[key] = now + _REST_COOLDOWN_S
         _REST_CACHE.pop(key, None)
         return None
     _REST_CACHE[key] = (now + ttl, payload)
@@ -2107,8 +2189,15 @@ def _engine_instance_stats(entry: dict) -> dict:
             pass
     if entry.get("username") and entry.get("password") and entry.get("port"):
         # honest about why live marks are stale: a wedged engine (429
-        # storm / warm-up) is in REST back-off, not "down"
-        cd = _REST_COOLDOWN.get(str(entry.get("bot_code")))
+        # storm / warm-up) is in REST back-off, not "down". Cooldown is
+        # per-(bot, path) — surface the worst active back-off across the
+        # REST paths the stats probe touches (status + balance).
+        bot = str(entry.get("bot_code"))
+        cd = 0.0
+        for p in ((bot, "/api/v1/status"), (bot, "/api/v1/balance")):
+            t = _REST_COOLDOWN.get(p, 0)
+            if t > cd:
+                cd = t
         out["api_backoff"] = bool(cd and cd > time.time())
         status = _engine_rest(entry, "/api/v1/status")
         out["api_ok"] = status is not None
@@ -2275,7 +2364,17 @@ def _engine_session_payload() -> dict:
         stats = _engine_instance_stats(entry)
         stats["pair"] = entry.get("pair")
         stats["port"] = entry.get("port")
-        stats["status"] = entry.get("status")
+        # Derive status live — registry.json's "status" is a snapshot from
+        # registration time and never updates, so the live signal is:
+        #   running   — pid is alive AND the engine REST probe succeeded
+        #   starting  — pid is alive but REST hasn't come up yet (warm-up)
+        #   down      — pid is gone
+        pid_alive = bool(entry.get("pid")) and _pid_alive(entry["pid"])
+        stats["status"] = (
+            "running" if pid_alive and stats.get("api_ok") else
+            "starting" if pid_alive else
+            "down"
+        )
         stats["channel"] = _live_geometry(entry)
         instances.append(stats)
     return {"at": utcnow(), "instances": instances}
@@ -2317,10 +2416,14 @@ def _reliability_live() -> dict:
                               "tradesv3.dryrun.sqlite")
             if not os.path.isfile(db):
                 continue
-            try:
-                newest = max(newest, os.stat(db).st_mtime)
-            except OSError:
-                pass
+            # SQLite WAL: live writes land in the -wal sidecar and the main
+            # DB mtime only advances on checkpoint — freshness must track
+            # both or it under-reports a fleet that is actively trading.
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    newest = max(newest, os.stat(db + suffix).st_mtime)
+                except OSError:
+                    pass
             try:
                 trips, _report = from_sqlite(db, source_id=code)
             except Exception:
@@ -2360,6 +2463,11 @@ def overview_payload() -> dict:
         "engine": engine_payload(),
         "ft_fleet": ft_fleet_payload(),
         "ctl": {"reachable": ok_status, "status": ctl_status if ok_status else None},
+        # readiness takes the standalone probe UNLESS a live ctl plane
+        # answered with a real status dict — the retired-ctl error body is
+        # a truthy dict and must never masquerade as one (that fusion was
+        # how the M3 companion daemon's diagnostics leaked into the strip)
+        "readiness": _readiness(ctl_status if ok_status else None),
         # WT-era fleet map retired: the frozen state.json bots/slots would
         # render September-8 skeletons as if live. The board draws from
         # ft_fleet (live instances) instead.
@@ -2369,7 +2477,6 @@ def overview_payload() -> dict:
         "journal_tail": _engine_events(40),
         "reliability": reliability_payload(),
         "pocketbase": {"up": pb_ok},
-        "readiness": _readiness(ctl_status),
         # the screen cache age comes from state["screen_cache"]["at"]
         # (epoch float written by rescreen_cycle at daemon.py:2327-2330),
         # NOT from state["optimizer"] which the original line read — the
@@ -2908,13 +3015,15 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/api/screen":
             self._json(200, {"screen": screen_payload()})
         elif route == "/api/optimizer":
-            ok, body = _ctl("/optimizer")
             # The WT-era daemon ran a slow-loop position optimizer that
             # edited WunderTrading grids directly. In this workspace the
             # execution engine is freqtrade-dry-run — the strategy (GridStrategy)
             # is what adjusts the grid per candle, no separate optimizer chain
             # applies. Return a "not applicable" payload so the Optimizer
             # tab renders an honest explanation instead of an error toast.
+            # (No ctl round-trip: the ctl plane is retired here — see
+            # CTL_RETIRED — and the optimizer payload is built entirely from
+            # workspace artifacts.)
             self._json(200, {"optimizer": None,
                              "applicable": False,
                              "engine": "freqtrade",
@@ -2936,11 +3045,11 @@ class Handler(BaseHTTPRequestHandler):
             # fail-soft: degrade with a 200 + {"error": ...} so the UI can
             # keep rendering last-persisted state when the daemon is down
             self._json(200, body if ok else
-                       {"error": "ctl unreachable", "detail": body})
+                       {"error": _ctl_err(body), "detail": body})
         elif route == "/api/status":
             ok, body = _ctl_cached("/status")
             self._json(200, body if ok else
-                       {"error": "ctl unreachable", "detail": body})
+                       {"error": _ctl_err(body), "detail": body})
         elif route == "/api/pnl":
             self._json(200, pnl_payload())
         elif route == "/api/chart":
