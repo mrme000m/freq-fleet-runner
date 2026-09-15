@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>grid/autonomy — mission console</title>
+  <meta name="description" content="Observation, configuration and dev control for the standalone freqtrade dry-run grid-trading fleet.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23F1F4EF'/%3E%3Cpath d='M6 10h20M6 16h20M6 22h20' stroke='%23182420' stroke-width='2.4'/%3E%3Cpath d='M16 4v24' stroke='%230A7E6D' stroke-width='2.4'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-row">
+    <div class="brand">
+      <span class="brand-title">grid<span class="slash">/</span>autonomy</span>
+      <span class="brand-sub" id="mission-sub" title="Active execution backend (state/engine.json). The standalone mission runs on the freqtrade dry-run engine; the WunderTrading paper engine was retired 2026-09-15.">mission console · freqtrade dry-run · engine: …</span>
+    </div>
+    <div class="statusbar" id="statusbar" aria-live="polite">
+      <span class="chip"><span class="dot"></span>connecting…</span>
+    </div>
+  </div>
+  <nav class="tabs" role="tablist" aria-label="Console views">
+    <button class="tab" role="tab" id="tab-fleet" aria-selected="true" aria-controls="view-fleet">Fleet</button>
+    <button class="tab" role="tab" id="tab-decisions" aria-selected="false" aria-controls="view-decisions">Decisions</button>
+    <button class="tab" role="tab" id="tab-reports" aria-selected="false" aria-controls="view-reports">Run cards</button>
+    <button class="tab" role="tab" id="tab-optimizer" aria-selected="false" aria-controls="view-optimizer">Optimizer</button>
+    <button class="tab" role="tab" id="tab-reliability" aria-selected="false" aria-controls="view-reliability">Reliability</button>
+    <button class="tab" role="tab" id="tab-config" aria-selected="false" aria-controls="view-config">Config</button>
+    <button class="tab" role="tab" id="tab-logs" aria-selected="false" aria-controls="view-logs">Logs</button>
+  </nav>
+</header>
+
+<main class="main">
+
+  <!-- ══ FLEET ══ -->
+  <section class="view" id="view-fleet" role="tabpanel" aria-labelledby="tab-fleet">
+    <div id="fleet-banner"></div>
+    <div class="card pnl-header" id="pnl-header" aria-live="polite">
+      <div class="pnl-header-skel">fleet PnL header loading…</div>
+    </div>
+    <div class="readiness card" id="readiness" aria-live="polite"></div>
+    <div class="fleet-layout">
+      <div class="fleet-grid" id="slot-board"></div>
+      <aside class="rail" style="display:flex;flex-direction:column;gap:16px;">
+        <div class="card controls-card">
+          <div class="card-head"><span class="card-title">Controls</span></div>
+          <div class="card-body">
+            <div class="ctl-grid">
+              <button class="btn btn--danger" id="ctl-halt" title="Stop the mission stack (engine + console) via grid/dev">Halt mission</button>
+              <button class="btn" id="ctl-unkill" hidden>Clear KILL</button>
+              <button class="btn btn--wide" id="ctl-restart">Restart mission</button>
+              <button class="btn btn--wide" id="ctl-stop">Stop mission</button>
+            </div>
+          </div>
+        </div>
+        <div class="card controls-card">
+          <div class="card-head"><span class="card-title">Dev maintenance</span></div>
+          <div class="card-body">
+            <div class="ctl-grid">
+              <button class="btn btn--wide" id="dev-clean" title="dev clean — clear logs, run cards, market caches, watch specs">Clear logs &amp; artifacts</button>
+              <button class="btn btn--wide btn--danger" id="dev-reset" title="dev reset — wipe daemon runtime state (backup kept), stop the stack">Reset system state</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Live feed</span>
+            <span class="spacer"></span>
+            <span class="chip chip--ok" style="padding:2px 8px;"><span class="dot pulse" id="feed-dot"></span><span id="feed-age">—</span></span>
+          </div>
+          <ul class="feed" id="feed"></ul>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">LLM brains</span>
+            <span class="spacer"></span>
+            <span class="mono" style="font-size:10.5px;color:var(--ink-faint)" id="llm-brains-at">—</span>
+          </div>
+          <div id="llm-brains" style="padding:8px 14px;">
+            <div class="empty-note">Provider pings + role routing render here from the workspace sidecar <code class="mono">state/llm.env</code>. The LLM swarm itself is an autonomy-brain (M3) component — the standalone freqtrade engine makes no LLM calls.</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><span class="card-title">Fleet summary</span></div>
+          <div class="card-body"><div class="mini-kv" id="fleet-summary"></div></div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ══ DECISIONS ══ -->
+  <section class="view" id="view-decisions" role="tabpanel" aria-labelledby="tab-decisions" hidden>
+    <div class="view-head">
+      <h2>Decision ledger</h2>
+      <span class="sub">Live engine decisions — grid fills, trade opens and closes from the dry-run freqtrade instance(s). The WT-era deliberate → guard → deploy journal is preserved on disk (<code class="mono">state/decisions.jsonl</code>) and has had no writer since the brain was retired.</span>
+    </div>
+    <div class="banner-slot" id="dec-engine"></div>
+    <div class="filter-row">
+      <input type="text" id="dec-filter" placeholder="filter engine events…">
+      <span class="mono" id="dec-count" style="font-size:11px;color:var(--ink-faint)"></span>
+    </div>
+    <div class="card"><div class="card-body--tight table-wrap">
+      <table class="ledger">
+        <thead><tr><th>at</th><th>bot</th><th>kind</th><th>event</th></tr></thead>
+        <tbody id="dec-body"></tbody>
+      </table>
+    </div></div>
+  </section>
+
+  <!-- ══ RUN CARDS ══ -->
+  <section class="view" id="view-reports" role="tabpanel" aria-labelledby="tab-reports" hidden>
+    <div class="view-head">
+      <h2>Run cards</h2>
+      <span class="sub">The live engine session below is the standalone system's run. The WT-era report archive (<code class="mono">state/reports/</code>, last card 2026-09-14 21:00:46Z) is preserved on disk and no longer displayed.</span>
+    </div>
+    <div class="banner-slot" id="rc-engine"></div>
+  </section>
+
+  <!-- ══ POSITION OPTIMIZER ══ -->
+  <section class="view" id="view-optimizer" role="tabpanel" aria-labelledby="tab-optimizer" hidden>
+    <div class="view-head">
+      <h2>Position optimizer</h2>
+      <span class="sub">Slow-loop recommendations (fresh-candle grid revaluation, TP/SL/trailing exit scoring) — advisory by default, each with its apply-gate verdict.</span>
+    </div>
+    <div class="card" id="opt-fast"></div>
+    <p></p>
+    <div class="card" id="opt-latest-analysis"></div>
+    <p></p>
+    <div class="card" id="opt-data-sources"></div>
+    <p></p>
+    <div class="card" id="opt-trackers"></div>
+    <p></p>
+    <div class="card" id="opt-swaps"></div>
+    <p></p>
+    <div id="opt-banner"></div>
+    <div class="card">
+      <div class="card-head"><span class="card-title">Pending · unapplied</span>
+        <span class="spacer"></span><span class="mono" id="opt-pending-count" style="font-size:11px;color:var(--ink-faint)"></span></div>
+      <div class="card-body--tight table-wrap">
+        <table class="ledger">
+          <thead><tr>
+            <th>at</th><th>slot</th><th>market</th><th>rec</th><th>Δ expected</th>
+            <th>confidence</th><th>trigger</th><th>blocked by</th><th>rationale</th>
+          </tr></thead>
+          <tbody id="opt-pending-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <p></p>
+    <div class="card">
+      <div class="card-head"><span class="card-title">Applied</span>
+        <span class="spacer"></span><span class="mono" id="opt-applied-count" style="font-size:11px;color:var(--ink-faint)"></span></div>
+      <div class="card-body--tight table-wrap">
+        <table class="ledger">
+          <thead><tr>
+            <th>applied at</th><th>slot</th><th>market</th><th>rec</th><th>Δ expected</th>
+            <th>confidence</th><th>trigger</th><th>rationale</th>
+          </tr></thead>
+          <tbody id="opt-applied-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ RELIABILITY ══ -->
+  <section class="view" id="view-reliability" role="tabpanel" aria-labelledby="tab-reliability" hidden>
+    <div class="view-head">
+      <h2>Reliability ledger</h2>
+      <span class="sub">Closed round-trips per regime archetype gate the sizing ladder: base &lt;10 samples → probe ≥10 → full ≥30 &amp; PF ≥1.3; recent PF &lt;1.0 kills the archetype.</span>
+    </div>
+    <div class="view-head"><span class="sub">Aggregates come from the daemon’s snapshot ledger (24h refresh). Synthetic/seeded samples are counted out of the real-sample column; expectancies and PF are only trustworthy when the synthetic count is zero.</span></div>
+    <div class="banner-slot" id="rel-freshness"></div>
+    <div id="rel-note"></div>
+    <div class="card"><div class="card-body--tight table-wrap">
+      <table class="ledger">
+        <thead><tr>
+          <th>archetype</th><th>samples</th><th>real / synth</th><th>progress → full</th><th>next rung</th>
+          <th>profit factor</th><th>recent PF</th><th>win rate</th><th>expectancy</th><th>max DD</th><th>tier</th>
+        </tr></thead>
+        <tbody id="rel-body"></tbody>
+      </table>
+    </div></div>
+  </section>
+
+  <!-- ══ CONFIG ══ -->
+  <section class="view" id="view-config" role="tabpanel" aria-labelledby="tab-config" hidden>
+    <div class="view-head">
+      <h2>Configuration</h2>
+      <span class="sub">Edits write <code class="mono">config.yaml</code> in place (comments preserved, backup kept). The daemon reads config at startup — restart to apply.</span>
+    </div>
+    <div id="config-banner"></div>
+    <div class="banner-slot" id="cfg-freshness"></div>
+    <div class="config-layout">
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">Editable knobs</span>
+          <span class="spacer"></span>
+          <button class="btn btn--primary" id="cfg-save">Save changes</button>
+        </div>
+        <div class="card-body" id="cfg-fields"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><span class="card-title">Contract (read-only)</span></div>
+        <div class="card-body kv-view" id="cfg-readonly"></div>
+      </div>
+      <div class="card card--full">
+        <div class="card-head">
+          <span class="card-title">LLM providers</span>
+          <span class="sub">Set NVIDIA / OpenRouter keys &amp; models, order the fallback chain, validate live, and route each swarm agent to a provider. Persists to <code class="mono">state/llm.env</code> (workspace, 0600); keys never echo. Consumed by the autonomy brain when it lands (M3) — the standalone freqtrade engine makes no LLM calls.</span>
+        </div>
+        <div class="card-body llm-body">
+          <div class="llm-top">
+            <div class="llm-ladder-wrap">
+              <span class="llm-label">Fallback chain</span>
+              <div class="llm-ladder" id="llm-ladder"></div>
+            </div>
+            <div class="llm-validate-wrap">
+              <span class="llm-label">Live validation</span>
+              <button class="btn" id="llm-validate-all">Validate all</button>
+              <span class="mono llm-validate-note" id="llm-validate-note">not run</span>
+            </div>
+          </div>
+          <div class="llm-providers" id="llm-providers"></div>
+          <div class="llm-matrix-wrap">
+            <span class="llm-label">Agent → provider routing</span>
+            <div class="llm-matrix" id="llm-matrix"></div>
+          </div>
+          <div class="llm-actions">
+            <span class="mono llm-sidecar-note" id="llm-sidecar-note"></span>
+            <span class="spacer"></span>
+            <button class="btn btn--primary" id="llm-save">Save LLM config</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ LOGS ══ -->
+  <section class="view" id="view-logs" role="tabpanel" aria-labelledby="tab-logs" hidden>
+    <div class="view-head">
+      <h2>Live logs</h2>
+      <span class="sub" id="log-path-head">Tailing <code class="mono" id="log-path">state/logs/*</code> — the WT-era state/daemon.log does not exist (brain is closed); the workspace-tail merges every live log file.</span>
+    </div>
+    <div class="banner-slot" id="log-freshness"></div>
+    <div class="log-controls">
+      <input type="text" id="log-grep" placeholder="grep (regex, case-insensitive)…">
+      <label class="mono" style="font-size:12px;display:flex;align-items:center;gap:6px;">
+        <input type="checkbox" id="log-follow" checked> follow
+      </label>
+      <select id="log-lines">
+        <option value="150">150 lines</option>
+        <option value="400" selected>400 lines</option>
+        <option value="1000">1000 lines</option>
+      </select>
+      <span class="mono" id="log-count" style="font-size:11px;color:var(--ink-faint)"></span>
+    </div>
+    <div class="logbox" id="logbox" tabindex="0">—</div>
+  </section>
+
+  <p class="footer-note" id="footnote">grid/autonomy console · freqtrade dry-run · 127.0.0.1</p>
+</main>
+
+<div id="modal-root"></div>
+<div class="toast-wrap" id="toasts" aria-live="polite"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

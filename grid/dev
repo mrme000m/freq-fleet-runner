@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""grid/dev — start and manage the STANDALONE grid system from this repo.
+
+Usage:
+  grid/dev status                     everything at a glance
+  grid/dev start [--no-ft] [--no-console]
+  grid/dev stop  [--keep-ft] [--keep-console]
+  grid/dev restart
+  grid/dev pb [start|stop|status]     workspace PocketBase lifecycle
+  grid/dev logs [ft|console|pb] [lines]
+  grid/dev open                      open the console #fleet page in a browser
+  grid/dev ledger                    reliability-ledger summary (M4)
+
+What this manages (the standalone runtime):
+  pocketbase  the vendored PocketBase sidecar on 127.0.0.1:8290 (grid/.pocketbase/,
+              pb_data/ journal DB) — started BEFORE the console so journal
+              reads work from the first page load. Port 8290 is deliberately
+              NOT the M3 stack's 8090: the two runtimes must never cross-wire.
+  console   grid/console/server.py on 127.0.0.1:8798 — the mission console
+            (state: grid/state/, engine banner from state/engine.json)
+  engine    one dry-run freqtrade process — GridStrategy on BTC/USDC:USDC 1h
+            (Hyperliquid public data, .venv-ft, M2-tuned params band_atr 4.2 /
+            step_factor 0.21). The instance dir + registry entry live in
+            grid/state/ft_fleet/ft-btc/ using the SAME layout and entry
+            schema as the M3 backend, so the console fleet row (and the M3
+            daemon, once it lands) read it natively.
+
+What this deliberately does NOT manage:
+  the autonomy brain (screen → LLM swarm → deploy). It is still M3-in-flight
+  in the grid-autonomy repo; the WT-era daemon was closed 2026-09-15 (see
+  state/engine.json). When M3 lands here, `dev` grows a `brain` command.
+
+Everything here is DRY-RUN only: the instance config hardcodes
+dry_run: true. Nothing in this script can place a live order.
+"""
+import json
+import os
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+GRID = Path(__file__).resolve().parent          # grid/
+WS = GRID.parent                                 # repo root
+STATE = GRID / "state"
+FLEET = STATE / "ft_fleet"
+REGISTRY = FLEET / "registry.json"
+PIDS = STATE / "pids"
+CONSOLE_LOG = STATE / "logs" / "console.log"
+ENGINE_JSON = STATE / "engine.json"
+RELIABILITY = STATE / "reliability.json"
+
+PB_PORT = 8290                                    # NOT 8090 — that belongs
+                                                  # to the M3 stack in
+                                                  # grid-autonomy; this
+                                                  # standalone runtime must
+                                                  # never collide with it
+PB_DIR = GRID / ".pocketbase"                     # binary + pb.env + pb_hooks
+PB_BIN = PB_DIR / "pocketbase"
+PB_DATA = PB_DIR / "pb_data"
+PB_HEALTH = f"http://127.0.0.1:{PB_PORT}/api/health"
+PB_URL = f"http://127.0.0.1:{PB_PORT}"            # passed to the console env
+
+CONSOLE_PORT = 8798
+ENGINE_BASE_PORT = 8191                           # M3's backend allocates
+                                                  # 8091+ sequentially — stay
+                                                  # clear of that range so a
+                                                  # concurrent M3 smoke can
+                                                  # never collide with ours
+BOT_CODE = "ft-btc"
+BOT_DIR = FLEET / BOT_CODE
+PAIR = "BTC/USDC:USDC"
+DRY_RUN_WALLET = 1000.0                          # the M2 research budget
+
+FT_BIN = WS / ".venv-ft" / "bin" / "freqtrade"    # load-bearing for M3 — read-only use
+STRATEGY_SRC = GRID / "strategies"               # GridStrategy.py/.json + grid_geometry.py
+STRATEGY_FILES = ("GridStrategy.py", "GridStrategy.json", "grid_geometry.py")
+
+# the harness proxy is unreliable for exchange traffic (verified M3 gotcha) —
+# strip every proxy variable from the engine's environment
+_PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY",
+               "http_proxy", "https_proxy", "all_proxy", "ftp_proxy",
+               "NO_PROXY", "no_proxy")
+
+READY_TIMEOUT_S = 180                            # Hyperliquid startup data is slow
+STOP_GRACE_S = 15
+
+
+def _utcnow():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _http_ok(url, timeout=2.0):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _port_pid(port):
+    """The PID listening on `port`, via lsof (pidfiles can go stale)."""
+    try:
+        out = subprocess.run(["lsof", "-tiTCP:" + str(port), "-sTCP:LISTEN"],
+                             capture_output=True, text=True, timeout=5).stdout
+        pids = [p for p in out.split() if p.strip().isdigit()]
+        return int(pids[0]) if pids else None
+    except Exception:
+        return None
+
+
+def _pidfile_read(name):
+    try:
+        return int((PIDS / f"{name}.pid").read_text().strip())
+    except Exception:
+        return None
+
+
+def _pidfile_write(name, pid):
+    PIDS.mkdir(parents=True, exist_ok=True)
+    (PIDS / f"{name}.pid").write_text(f"{pid}\n")
+
+
+def _pidfile_clear(name):
+    try:
+        (PIDS / f"{name}.pid").unlink()
+    except FileNotFoundError:
+        pass
+
+
+# ── registry (workspace copy; same schema the M3 backend uses) ───────────
+
+def _allocate_port(reg):
+    """Next free port: skips ports other registry entries claim AND ports
+    with a live listener (e.g. an M3 smoke instance holding 8091+)."""
+    used = {int(e.get("port") or 0)
+            for e in reg["instances"].values() if isinstance(e, dict)}
+    port = ENGINE_BASE_PORT
+    while port in used or _port_pid(port) is not None:
+        port += 1
+    return port
+
+
+def load_registry():
+    try:
+        reg = json.loads(REGISTRY.read_text())
+        if isinstance(reg, dict) and isinstance(reg.get("instances"), dict):
+            return reg
+    except Exception:
+        pass
+    return {"version": 1, "instances": {}, "archived": []}
+
+
+def save_registry(reg):
+    REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    tmp = REGISTRY.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(reg, indent=2) + "\n")
+    tmp.replace(REGISTRY)
+
+
+# ── engine (dry-run freqtrade instance) ─────────────────────────────────
+
+def engine_config(port, username, password):
+    """The instance config — mirrors the verified ft_user_data/config.json
+    (hyperliquid futures/isolated dry-run, backtested M1/M2 shape) plus the
+    api_server + initial_state the M3 backend adds per instance."""
+    return {
+        "exchange": {
+            "name": "hyperliquid", "key": "", "secret": "",
+            "ccxt_config": {}, "ccxt_async_config": {},
+            "pair_whitelist": [PAIR], "pair_blacklist": [],
+        },
+        "trading_mode": "futures",
+        "margin_mode": "isolated",
+        "dry_run": True,
+        "dry_run_wallet": DRY_RUN_WALLET,
+        "stake_currency": "USDC",
+        "stake_amount": "unlimited",
+        "timeframe": "1h",
+        "max_open_trades": 1,
+        "entry_pricing": {"price_side": "same", "use_order_book": True,
+                          "order_book_top": 1},
+        "exit_pricing": {"price_side": "same", "use_order_book": True,
+                         "order_book_top": 1},
+        "unfilledtimeout": {"entry": 60, "exit": 60, "exit_timeout_count": 0,
+                            "unit": "minutes"},
+        "pairlists": [{"method": "StaticPairList"}],
+        "strategy": "GridStrategy",
+        "initial_state": "running",
+        "position_adjustment_enable": True,
+        "max_entry_position_adjustment": -1,
+        "tradable_balance_ratio": 0.85,
+        "fee": 0.001,
+        "api_server": {
+            "enabled": True, "listen_ip_address": "127.0.0.1",
+            "listen_port": int(port), "username": username,
+            "password": password, "CORS_origins": [], "verbosity": "error",
+        },
+    }
+
+
+def materialize():
+    """Create/refresh the instance dir + registry entry (idempotent).
+    Reuses an existing entry's port/credentials so a restarted instance
+    keeps its trades database and console identity."""
+    reg = load_registry()
+    entry = reg["instances"].get(BOT_CODE)
+
+    port = username = password = None
+    if entry and entry.get("username") and entry.get("password"):
+        username, password = entry["username"], entry["password"]
+        # engine_start() guarantees our engine is down when this runs, so a
+        # live listener on the registered port is a FOREIGN process (e.g. an
+        # M3 smoke instance holding 8091+) — move to a fresh port, keep creds
+        if entry.get("port") and _port_pid(entry["port"]) is None:
+            port = int(entry["port"])
+    if port is None:
+        port = _allocate_port(reg)
+    if not username:
+        username = secrets.token_urlsafe(8)
+    if not password:
+        password = secrets.token_urlsafe(12)
+
+    BOT_DIR.mkdir(parents=True, exist_ok=True)
+    (BOT_DIR / "strategies").mkdir(exist_ok=True)
+    for fn in STRATEGY_FILES:
+        shutil.copy2(STRATEGY_SRC / fn, BOT_DIR / "strategies" / fn)
+    with open(BOT_DIR / "config.json", "w") as f:
+        json.dump(engine_config(port, username, password), f, indent=2)
+
+    entry = {
+        "bot_code": BOT_CODE,
+        "dir": str(BOT_DIR),
+        "port": int(port),
+        "username": username,
+        "password": password,      # secrets live ONLY here + config.json
+        "pair": PAIR,
+        "pair_code": "BTCUSDC",
+        "symbol": "BTCUSDC",
+        "venue": "hyperliquid",
+        "exchange_code": "HYPERLIQUID_SWAP",
+        "grid_type": "long",
+        "slot_balance": DRY_RUN_WALLET,
+        "channel": {
+            "low": None, "mid": None, "high": None,
+            "step_pct": None, "atr_pct": None,
+            "grids": None,
+            "note": "channel computed at runtime by GridStrategy "
+                     "(tuned params band_atr 4.2, step_factor 0.21)",
+        },
+        "created_at": entry.get("created_at") if entry else _utcnow(),
+        "pid": None,
+        "status": "created",
+        "backend": "freqtrade-dry-run",
+        "spawned_by": "grid/dev",
+    }
+    reg["instances"][BOT_CODE] = entry
+    save_registry(reg)
+    return entry
+
+
+def _is_ours(pid):
+    """A listener pid is our engine only if it's a freqtrade process under
+    OUR userdir — never adopt a concurrent M3 smoke instance."""
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+        return "freqtrade" in out and str(BOT_DIR) in out
+    except Exception:
+        return False
+
+
+def engine_running(entry=None):
+    entry = entry or load_registry()["instances"].get(BOT_CODE)
+    if not entry:
+        return False, None
+    pid = entry.get("pid") or _pidfile_read(BOT_CODE)
+    if pid and _alive(pid):
+        return True, int(pid)
+    p = _port_pid(entry.get("port"))
+    if p and _is_ours(p):
+        return True, p
+    return False, None
+
+
+def engine_start():
+    running, pid = engine_running()
+    if running:
+        print(f"engine ft-btc already running (pid {pid})")
+        return
+    if not FT_BIN.is_file():
+        sys.exit(f"missing freqtrade binary: {FT_BIN} (.venv-ft is "
+                 "path-load-bearing for M3 — do not move/rename)")
+    for fn in STRATEGY_FILES:
+        if not (STRATEGY_SRC / fn).is_file():
+            sys.exit(f"missing strategy file: {STRATEGY_SRC / fn}")
+
+    entry = materialize()
+    port = int(entry["port"])
+    if _port_pid(port):
+        sys.exit(f"port {port} already in use but no live engine — "
+                 f"investigate (lsof -iTCP:{port})")
+
+    env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
+    env["PYTHONUNBUFFERED"] = "1"
+    log = open(BOT_DIR / "freqtrade.log", "ab")
+    proc = subprocess.Popen(
+        [str(FT_BIN), "trade", "--dry-run", "--userdir", str(BOT_DIR),
+         "--config", str(BOT_DIR / "config.json")],
+        stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        start_new_session=True, env=env, cwd=str(BOT_DIR))
+    _pidfile_write(BOT_CODE, proc.pid)
+
+    reg = load_registry()
+    reg["instances"][BOT_CODE]["pid"] = proc.pid
+    reg["instances"][BOT_CODE]["status"] = "starting"
+    save_registry(reg)
+
+    print(f"engine ft-btc starting (pid {proc.pid}, port {port}, "
+          f"{PAIR} 1h DRY-RUN, Hyperliquid) — waiting for /ping …")
+    t0 = time.time()
+    while time.time() - t0 < READY_TIMEOUT_S:
+        if not _alive(proc.pid):
+            tail = _tail(BOT_DIR / "freqtrade.log", 5)
+            sys.exit("engine died during startup. Last log lines:\n  " +
+                     "\n  ".join(tail))
+        if _http_ok(f"http://127.0.0.1:{port}/api/v1/ping", timeout=2):
+            reg = load_registry()
+            reg["instances"][BOT_CODE]["status"] = "running"
+            reg["instances"][BOT_CODE]["pid"] = proc.pid
+            save_registry(reg)
+            print(f"engine ft-btc READY ({int(time.time() - t0)}s) — "
+                  f"API http://127.0.0.1:{port}/  · dry-run paper only")
+            return
+        time.sleep(2)
+    print(f"engine not ready after {READY_TIMEOUT_S}s — it may still be "
+          f"loading market data; check: grid/dev logs ft")
+
+
+def _terminate(pid, grace_s=STOP_GRACE_S):
+    if not _alive(pid):
+        return True
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except OSError:
+        return True
+    t0 = time.time()
+    while _alive(pid) and time.time() - t0 < grace_s:
+        time.sleep(0.5)
+    if _alive(pid):
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+        except OSError:
+            pass
+        time.sleep(1)
+    return not _alive(pid)
+
+
+def engine_stop():
+    reg = load_registry()
+    entry = reg["instances"].get(BOT_CODE)
+    running, pid = engine_running(entry)
+    if not running:
+        print("engine ft-btc already stopped")
+    else:
+        ok = _terminate(pid)
+        print(f"engine ft-btc {'stopped' if ok else 'FAILED to stop'} "
+              f"(was pid {pid})")
+    if entry:
+        entry["pid"] = None
+        entry["status"] = "stopped"
+        save_registry(reg)
+    _pidfile_clear(BOT_CODE)
+
+
+# ── pocketbase (vendored workspace sidecar, 127.0.0.1:8290) ─────────────
+
+def _pb_is_ours(pid):
+    """A listener on :8290 is our PocketBase only if its command runs the
+    .pocketbase binary under THIS grid/ — same philosophy as _is_ours. A
+    foreign listener (e.g. the M3 stack) is reported and left alone."""
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+        return str(PB_DIR) in out and "pocketbase" in out
+    except Exception:
+        return False
+
+
+def pb_running():
+    """(up, pid, ours) for the workspace PocketBase on :8290."""
+    pid = _pidfile_read("pb")
+    if pid and _alive(pid) and _pb_is_ours(pid):
+        return _http_ok(PB_HEALTH, timeout=2), int(pid), True
+    port_pid = _port_pid(PB_PORT)
+    if port_pid:
+        return (_http_ok(PB_HEALTH, timeout=2), port_pid,
+                _pb_is_ours(port_pid))
+    if _http_ok(PB_HEALTH, timeout=2):     # lsof blind spot — assume ours
+        return True, None, True
+    return False, None, True
+
+
+def pb_start():
+    up, pid, ours = pb_running()
+    if up and ours:
+        print(f"pocketbase already running (pid {pid}) on :{PB_PORT}")
+        if pid:
+            _pidfile_write("pb", pid)
+        return
+    if up and not ours:
+        print(f"NOTICE: port {PB_PORT} is held by a FOREIGN process "
+              f"(pid {pid}) — leaving it alone; pocketbase NOT started")
+        return
+    if not PB_BIN.is_file():
+        sys.exit(f"missing pocketbase binary: {PB_BIN}")
+    if not PB_DATA.is_dir():
+        sys.exit(f"missing pocketbase data dir: {PB_DATA}")
+    STATE.joinpath("logs").mkdir(parents=True, exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
+    log = open(STATE / "logs" / "pb.log", "ab")
+    proc = subprocess.Popen(
+        [str(PB_BIN), "serve", "--dir", str(PB_DATA), "--http",
+         f"127.0.0.1:{PB_PORT}"],
+        stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        start_new_session=True, env=env, cwd=str(PB_DIR))
+    _pidfile_write("pb", proc.pid)
+    print(f"pocketbase starting (pid {proc.pid}) on :{PB_PORT} — waiting "
+          f"for /api/health …")
+    t0 = time.time()
+    while time.time() - t0 < 15:
+        if not _alive(proc.pid):
+            tail = _tail(STATE / "logs" / "pb.log", 5)
+            sys.exit("pocketbase died during startup. Last log lines:\n  " +
+                     "\n  ".join(tail))
+        if _http_ok(PB_HEALTH, timeout=2):
+            print(f"pocketbase READY ({int(time.time() - t0)}s) — "
+                  f"{PB_URL}")
+            return
+        time.sleep(0.5)
+    print(f"pocketbase not ready after 15s — check: grid/dev logs pb")
+
+
+def pb_stop():
+    up, pid, ours = pb_running()
+    if up and not ours:
+        print(f"NOTICE: port {PB_PORT} is held by a FOREIGN process "
+              f"(pid {pid}) — leaving it alone")
+        return
+    if not (pid and _alive(pid)):
+        print("pocketbase already stopped")
+        _pidfile_clear("pb")
+        return
+    ok = _terminate(pid)
+    print(f"pocketbase {'stopped' if ok else 'FAILED to stop'} "
+          f"(was pid {pid})")
+    _pidfile_clear("pb")
+
+
+def cmd_pb(arg=None):
+    arg = (arg or "start").lower()
+    if arg.startswith("stop"):
+        pb_stop()
+    elif arg.startswith("status"):
+        up, pid, ours = pb_running()
+        if up and ours:
+            print(f"pocketbase RUNNING (pid {pid}) on :{PB_PORT} — "
+                  f"health ok")
+        elif up:
+            print(f"pocketbase :{PB_PORT} held by a FOREIGN process "
+                  f"(pid {pid}) — not ours")
+        else:
+            print(f"pocketbase stopped — start: grid/dev pb")
+    else:
+        pb_start()
+
+
+# ── console ─────────────────────────────────────────────────────────────
+
+
+def console_running():
+    if _http_ok(f"http://127.0.0.1:{CONSOLE_PORT}/", timeout=2):
+        return True, _port_pid(CONSOLE_PORT)
+    return False, None
+
+
+def console_start():
+    running, pid = console_running()
+    if running:
+        print(f"console already running (pid {pid}) on :{CONSOLE_PORT}")
+        if pid:
+            _pidfile_write("console", pid)
+        return
+    STATE.joinpath("logs").mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "CONSOLE_PORT": str(CONSOLE_PORT),
+           "PB_URL": PB_URL}
+    log = open(CONSOLE_LOG, "ab")
+    proc = subprocess.Popen([sys.executable, "console/server.py"],
+                            stdout=log, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL, cwd=str(GRID),
+                            start_new_session=True, env=env)
+    _pidfile_write("console", proc.pid)
+    t0 = time.time()
+    while time.time() - t0 < 15:
+        if _http_ok(f"http://127.0.0.1:{CONSOLE_PORT}/", timeout=1):
+            print(f"console running (pid {proc.pid}) on "
+                  f"http://127.0.0.1:{CONSOLE_PORT}/#fleet")
+            return
+        time.sleep(0.5)
+    sys.exit(f"console failed to start — check {CONSOLE_LOG}")
+
+
+def console_stop():
+    running, pid = console_running()
+    if not running:
+        pid = _pidfile_read("console")
+        if not (pid and _alive(pid)):
+            print("console already stopped")
+            _pidfile_clear("console")
+            return
+    ok = _terminate(pid)
+    print(f"console {'stopped' if ok else 'FAILED to stop'} (was pid {pid})")
+    _pidfile_clear("console")
+
+
+# ── reports ─────────────────────────────────────────────────────────────
+
+def _tail(path, n=20):
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+        return lines[-n:]
+    except Exception:
+        return [f"(no log at {path})"]
+
+
+def _tier(stats):
+    samples = stats.get("samples") or 0
+    pf = stats.get("profit_factor") or 0.0
+    recent = stats.get("recent_pf") or 0.0
+    if samples and recent < 1.0:
+        return "KILLED"
+    if samples >= 30 and pf >= 1.3:
+        return "full"
+    if samples >= 10:
+        return "probe"
+    return "base"
+
+
+def ledger_summary():
+    try:
+        led = json.loads(RELIABILITY.read_text())
+    except Exception:
+        return ["ledger: (none yet at grid/state/reliability.json — "
+                "see python3 -m grid.reliability.ledger --help)"]
+    rows = ["ledger (grid/state/reliability.json):"]
+    total = synth = 0
+    for arch in sorted(led):
+        s = led[arch] or {}
+        total += s.get("samples") or 0
+        synth += s.get("synthetic_samples") or 0
+        rows.append(f"  {arch:34s} samples {s.get('samples', 0):>4d} "
+                    f"(+{s.get('synthetic_samples', 0):<3d} synth) · "
+                    f"pf {s.get('profit_factor', 0):>6.2f} · "
+                    f"recent {s.get('recent_pf', 0):>6.2f} · tier {_tier(s)}")
+    rows.append(f"  total {total} real samples, {synth} synthetic")
+    return rows
+
+
+def cmd_status():
+    print(f"standalone grid system — {GRID}")
+    if ENGINE_JSON.is_file():
+        try:
+            e = json.loads(ENGINE_JSON.read_text())
+            print(f"engine declared : {e.get('engine')} / {e.get('mode')} "
+                  f"(since {e.get('since')})")
+            leg = e.get("legacy") or {}
+            if leg.get("closed_at"):
+                print(f"legacy closed   : {leg.get('engine')} "
+                      f"{leg.get('mode')} at {leg.get('closed_at')}")
+        except Exception:
+            pass
+    up, pid, ours = pb_running()
+    if up and ours:
+        print(f"pocketbase      : RUNNING (pid {pid}) · :{PB_PORT} · "
+              f"health {'ok' if _http_ok(PB_HEALTH, 2) else 'unreachable'}")
+    elif up:
+        print(f"pocketbase      : FOREIGN process (pid {pid}) on :{PB_PORT} "
+              f"— left alone")
+    else:
+        print(f"pocketbase      : stopped — start: {Path(__file__).name} pb")
+    running, pid = console_running()
+    print(f"console         : "
+          f"{'RUNNING' if running else 'stopped'}"
+          + (f" (pid {pid}) · http://127.0.0.1:{CONSOLE_PORT}/#fleet"
+             if running else
+             f"  → start: {Path(__file__).name} start"))
+    reg = load_registry()
+    entry = reg["instances"].get(BOT_CODE)
+    running, pid = engine_running(entry)
+    if running:
+        ping = _http_ok(
+            f"http://127.0.0.1:{entry.get('port')}/api/v1/ping", 2)
+        print(f"engine ft-btc    : RUNNING (pid {pid}, port "
+              f"{entry.get('port')}, API {'ok' if ping else 'unreachable'}) · "
+              f"{entry.get('pair')} 1h DRY-RUN")
+        trades = BOT_DIR / "tradesv3.dryrun.sqlite"
+        print(f"                   dry-run trades db: "
+              f"{trades if trades.exists() else '(none yet)'}")
+    elif entry:
+        print(f"engine ft-btc    : stopped (port {entry.get('port')}) · "
+              f"{entry.get('pair')} 1h dry-run — start: "
+              f"{Path(__file__).name} start")
+    else:
+        print(f"engine ft-btc    : not created — "
+              f"start: {Path(__file__).name} start")
+    arch = len(reg.get("archived") or [])
+    print(f"ft_fleet registry: {len(reg['instances'])} instance(s) · "
+          f"{arch} archived")
+    print(f"brain (autonomy) : NOT in this repo — M3 in flight in "
+          f"grid-autonomy; the WT-era daemon was closed with the legacy "
+          f"engine (see state/engine.json)")
+    for row in ledger_summary():
+        print(row)
+
+
+def cmd_logs(which="ft", n=40):
+    which = (which or "ft").lower()
+    if which.startswith("con"):
+        path, label = CONSOLE_LOG, "console"
+    elif which == "pb":
+        path, label = STATE / "logs" / "pb.log", "pocketbase"
+    else:
+        path, label = BOT_DIR / "freqtrade.log", "engine ft-btc"
+    print(f"── {label}: last {n} lines of {path} " + "─" * 20)
+    for line in _tail(path, n):
+        print(line)
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    args = argv[2:]
+    if cmd == "status":
+        cmd_status()
+    elif cmd == "pb":
+        cmd_pb(args[0] if args else None)
+    elif cmd == "start":
+        no_ft = "--no-ft" in args
+        no_con = "--no-console" in args
+        pb_start()
+        if not no_con:
+            console_start()
+        if not no_ft:
+            engine_start()
+        if not no_con and no_ft:
+            print("(engine skipped: --no-ft)")
+    elif cmd == "stop":
+        engine_stop() if "--keep-ft" not in args else print("engine kept (--keep-ft)")
+        console_stop() if "--keep-console" not in args else print("console kept (--keep-console)")
+        pb_stop() if "--keep-pb" not in args else print("pocketbase kept (--keep-pb)")
+    elif cmd == "restart":
+        engine_stop()
+        console_stop()
+        pb_stop()
+        pb_start()
+        console_start()
+        engine_start()
+    elif cmd == "logs":
+        which = args[0] if args else "ft"
+        n = int(args[1]) if len(args) > 1 else 40
+        cmd_logs(which, n)
+    elif cmd == "open":
+        import webbrowser
+        url = f"http://127.0.0.1:{CONSOLE_PORT}/#fleet"
+        webbrowser.open(url)
+        print(f"opened {url}")
+    elif cmd == "ledger":
+        for row in ledger_summary():
+            print(row)
+        print("refresh: python3 -m grid.reliability.ledger "
+              "--sqlite <db>=<archetype> --report   (M4 CLI)")
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

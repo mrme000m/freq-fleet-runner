@@ -30,3 +30,19 @@ npm-debug.log*
 known_hosts
 *.log
 .DS_Store
+
+# ── python hygiene (grid/ core) ─────────────────────────────────────────────
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# grid/ runtime state — ledger output + archives are generated, not source
+grid/state/
+
+# grid/ PocketBase sidecar — vendored binary + journal DB + pb.env secrets
+grid/.pocketbase/
+
+# local freqtrade scratch (M0)
+.venv-ft/
+ft_user_data/
+Agents.md
