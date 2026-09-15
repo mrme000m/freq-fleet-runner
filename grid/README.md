@@ -17,11 +17,15 @@ execution/grid_geometry.py   pure geometry math: ATR-band channel, geometric
 strategies/GridStrategy.py   single-position DCA grid (M1/M2 verified):
                              ATR channel + geometric lines, per-line TP
                              via adjust_trade_position (tags grid_buy_Li /
-                             grid_sell_Lj), channel-top full exit.
+                             grid_sell_Lj), channel-top full exit. ATR% is
+                             renormalized to the 1h reference horizon
+                             (√-of-time per slot TF — see
+                             docs/reset-2026-09-15-lowertf.md) so the
+                             1h-tuned gates/geometry carry to the 1-5m band.
 strategies/GridStrategy.json M2-tuned hyperopt params (band_atr 4.2,
-                             step_factor 0.21 — Sharpe 9.0, +0.99% over
-                             the 90d BTC/USDC:USDC 1h window, 127/127 tp
-                             round trips won).
+                             step_factor 1.0 taker re-base from M5; the M2
+                             Sharpe 9.0 run used the maker-modeled 0.21 —
+                             see docs/reliability-ledger.md).
 strategies/grid_geometry.py  vendored copy — GridStrategy imports the
                              geometry from its own directory first.
 reliability/                 M4 — see docs/reliability-ledger.md.

@@ -26,6 +26,21 @@ M5 profitability pass (see docs/reliability-ledger.md §"Finding"):
     by config["ladder_pct"] (injected by the deployer from the M4
     reliability ledger ladder).
 
+Dynamic TF rescaling (2026-09-15 lower-TF band, 1m-5m):
+  * every ATR% the strategy consumes is renormalized to the 1h reference
+    horizon (ATR_REF_MINUTES) by a sqrt-of-time factor
+    _atr_scale(timeframe) = sqrt(60 / tf_minutes). The tuned params
+    (band_atr 4.2, min_atr_pct 0.3, the min_step_multiple x cost gate)
+    are denominated in 1h-horizon volatility; raw 1m ATR% is ~sqrt(60)
+    smaller, so without rescaling the absolute gates are unreachable
+    (BTC/1m raw ATR% maxes ~0.14% vs the 0.36% effective gate) and the
+    channel degenerates to +-4.2 x 0.06% = +-0.25% — a pinhole price
+    blows through in minutes. Rescaled, a 1h slot stays bit-equal
+    (factor 1.0) and a 1m-5m slot keeps the calibrated economics:
+    fee-clearing steps (~0.4-0.9%) inside a sane +-1-2% channel. The
+    lower-TF cadence shows up in management speed (per-candle downside
+    / refill / cooldown checks), not in degenerate geometry.
+
 Geometry resolution chain — all locations hold the SAME module, kept
 byte-identical by grid/tests/test_vendored_sync.py:
   1. `grid_geometry.py` vendored NEXT TO this file. freqtrade loads
@@ -38,6 +53,7 @@ byte-identical by grid/tests/test_vendored_sync.py:
      copy has no vendored sibling and must resolve the original source.
 """
 import json
+import math
 import os
 import sys
 from datetime import datetime, timedelta
@@ -92,6 +108,33 @@ def _tf_timedelta(tf: str, n: int):
     if unit == "d":
         return timedelta(days=n * mult)
     return timedelta(minutes=n * mult)
+
+
+# --- ATR reference horizon (dynamic TF rescaling) -------------------------
+
+# The tuned params (band_atr 4.2, min_atr_pct 0.3, the min_step_multiple
+# x cost entry gate) are denominated in 1h-horizon volatility — they were
+# calibrated against ATR(14) on 1h candles (M2) and re-based on the same
+# horizon for the M5 taker pass. On the 1m-5m band raw ATR% is smaller by
+# ~sqrt(tf/1h) (variance grows with time), so a 1m slot without rescaling
+# can never reach the absolute floors (BTC/1m raw ATR% tops ~0.14% vs
+# the 0.36% effective gate) and its channel collapses to a pinhole
+# (+-4.2 x 0.06%). Renormalizing every ATR% to this reference horizon
+# restores the calibrated economics at ANY timeframe; a 1h slot stays
+# bit-equal (factor exactly 1.0) and 4h slots scale down symmetrically.
+ATR_REF_MINUTES = 60.0
+
+
+def _tf_minutes(tf: str) -> float:
+    """One candle of TF `tf` in minutes — unit-aware (1m=1, 5m=5, 1h=60)."""
+    return _tf_timedelta(tf, 1).total_seconds() / 60.0
+
+
+def _atr_scale(tf: str) -> float:
+    """sqrt-of-time factor renormalizing a TF's ATR% to the 1h reference
+    horizon: sqrt(ATR_REF_MINUTES / tf_minutes). 1m -> 7.746, 3m -> 4.472,
+    5m -> 3.464, 1h -> exactly 1.0 (the calibrated regime), 4h -> 0.5."""
+    return math.sqrt(ATR_REF_MINUTES / max(_tf_minutes(tf), 1e-9))
 
 
 class GridStrategy(IStrategy):
@@ -323,19 +366,31 @@ class GridStrategy(IStrategy):
 
     def populate_indicators(self, dataframe, metadata):
         dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
-        dataframe["atr_pct"] = dataframe["atr"] / dataframe["close"] * 100
+        # atr_pct is the REFERENCE-HORIZON (1h-equivalent) ATR%: the raw
+        # per-bar ATR% rescaled by _atr_scale(self.timeframe) so every
+        # ATR-denominated decision (entry gates, channel band, step
+        # size) carries the 1h-calibrated economics on any slot TF.
+        # Raw per-bar vol stays recoverable as atr/close*100.
+        dataframe["atr_pct"] = dataframe["atr"] / dataframe["close"] * 100 \
+            * _atr_scale(self.timeframe)
         dataframe["ema_short"] = ta.EMA(dataframe, timeperiod=12)
         dataframe["ema_long"] = ta.EMA(dataframe, timeperiod=26)
         return dataframe
 
-    def populate_entry_trend(self, dataframe, metadata):
-        # volatility gate: the grid step must clear fees by a healthy
-        # margin (min_step_multiple × cost) and clear an absolute ATR floor
-        cost = self._cost_floor()
-        req_atr = self.min_step_multiple.value * cost / \
+    def _entry_gate_atr(self) -> float:
+        """Minimum reference-horizon ATR% the entry filter requires:
+        the absolute floor (min_atr_pct) or the fee-clearance bar
+        (min_step_multiple x round-trip cost / step_factor), whichever
+        is higher."""
+        req_atr = self.min_step_multiple.value * self._cost_floor() / \
             max(self.step_factor.value, 1e-6)
-        vol_ok = dataframe["atr_pct"] >= \
-            max(self.min_atr_pct.value, req_atr)
+        return max(self.min_atr_pct.value, req_atr)
+
+    def populate_entry_trend(self, dataframe, metadata):
+        # volatility gate (reference-horizon ATR%): the grid step must
+        # clear fees by a healthy margin (min_step_multiple x cost) and
+        # clear an absolute ATR floor
+        vol_ok = dataframe["atr_pct"] >= self._entry_gate_atr()
         # trend gate: skip confirmed downtrends (close below EMA26 by more
         # than the tolerance); a long grid loses money averaging into them
         trend_ok = dataframe["close"] >= dataframe["ema_long"] * \

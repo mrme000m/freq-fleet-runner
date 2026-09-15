@@ -134,11 +134,63 @@ pair_candles` within seconds of start.
   ATR(14) + EMA(26) is therefore noisy. If a backtest or hyperopt is
   needed, use a different exchange or fetch the candles via
   `grid/screen.py:fetch_candles()` and feed them in directly.
-- **Strategy tuning was 1h-tuned** (band_atr 4.2, step_factor 1.0).
-  The M5 pass invariants (taker-fee floor, entry filter, trend gate)
-  are TF-agnostic, but the *band_atr* defaults were chosen for 1h
-  volatility; re-hyperopt for the 1-5m band is the obvious next
-  milestone (M6).
+- **Strategy tuning was 1h-tuned** (band_atr 4.2, step_factor 1.0) —
+  **resolved same day** by the dynamic ATR rescaling below: every
+  ATR%-denominated param is now interpreted at the 1h reference
+  horizon on any slot TF. A lower-TF re-hyperopt stays optional (M6),
+  not load-bearing.
 - **Ledger is empty** by design (fresh state). The first
   `grid/dev ledger-sync` after a few hours of dry-run will populate
   per-archetype samples at the new TFs.
+
+## Dynamic ATR rescaling (2026-09-15 — same-day follow-up)
+
+The first ~40 min at the lower-TF band produced **zero entries on all
+four slots**. Diagnosed live via `/api/v1/pair_candles`: every
+ATR%-denominated param (band_atr 4.2, min_atr_pct 0.3, and the
+min_step_multiple × cost gate — ≈ **0.36% effective** with taker fees)
+is denominated in **1h-horizon** volatility, while raw per-bar ATR% on
+the 1m-5m band is ~√(TF/1h) smaller:
+
+| Slot | TF | raw ATR% mean / max (2-3 d) | bars ≥ 0.36% gate |
+|------|----|----------------------------|-------------------|
+| ft-btc  | 1m | 0.059 / 0.14 | 0 / 1000 |
+| ft-eth  | 3m | 0.125 / 0.39 | 2 / 1000 |
+| ft-sol  | 3m | 0.130 / 0.28 | 0 / 1000 |
+| ft-hype | 5m | 0.262 / 0.63 | 281 / 1000 |
+
+So the fleet could only ever enter on vol spikes — BTC/1m never.
+
+**Fix: every ATR% the strategy consumes is renormalized to the 1h
+reference horizon** (`ATR_REF_MINUTES`) by a √-of-time factor
+`_atr_scale(timeframe) = sqrt(60 / tf_minutes)` — 1m → 7.746, 3m → 4.472,
+5m → 3.464, **1h → exactly 1.0** (the calibrated regime is bit-unchanged;
+4h+ scales down symmetrically).
+
+- `populate_indicators` now produces the **reference-horizon ATR%**
+  (`atr_pct` column); raw per-bar vol stays recoverable as
+  `atr/close×100`.
+- Entry gate, channel band, and step size all read that column, so the
+  1h-calibrated economics carry to any TF: at the mean vols above the
+  slots gate at 0.465 / 0.559 / 0.580 / 0.908 ≥ the 0.36% fee bar, with
+  fee-clearing steps (~0.4-0.9%) inside a sane ±1-2% channel instead of
+  the ±0.25% pinhole raw 1m vol gives.
+- **The M5 profitability invariants are untouched**: the fee-clearance
+  bar (min_step_multiple × round-trip taker cost) is TF-agnostic by
+  construction — a quiet 1m tape (raw 0.01%/bar → 0.077% at the
+  reference horizon) still never enters. Rescaling loosens nothing; it
+  only makes the horizon of the measured vol match the horizon the
+  gates were calibrated on.
+- The console's channel preview (server.py reads the bot's analyzed
+  dataframe `atr_pct` and mirrors the same geometry) stays consistent
+  automatically.
+- `grid/tests/test_lower_tf_rescale.py` pins the contract: scale
+  factors, the 0.36% default gate, entry fires at 1m/3m/5m mean vol but
+  not at 1h, thin vol stays blocked, fee-clearance + channel-density
+  invariants, and 1m/1h grid-identity at the same reference-horizon
+  vol (proving it is a horizon transform, not a retune).
+
+Tests: **105 passed** (97 + 8 new). Strategy re-vendored into
+`ft_user_data/strategies/` (byte-sync guard) and re-materialized into
+the four slots by `grid/scripts/restart.sh` (`engine_start` re-copies
+`STRATEGY_FILES` from `grid/strategies/`).
