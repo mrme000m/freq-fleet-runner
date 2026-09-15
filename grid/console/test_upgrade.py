@@ -49,7 +49,7 @@ class UpgradeTestCase(unittest.TestCase):
         self._saved = {
             "STATE_DIR": server.STATE_DIR, "CONFIG_PATH": server.CONFIG_PATH,
             "PB_URL": server.PB_URL, "PB_ENV_PATH": server.PB_ENV_PATH,
-            "KILL_FILE": server.KILL_FILE,
+            "KILL_FILE": server.KILL_FILE, "LLM_ENV_PATH": server.LLM_ENV_PATH,
             "_REL_CACHE": server._REL_CACHE, "_GEOM_CACHE": server._GEOM_CACHE,
         }
         server.STATE_DIR = os.path.join(self.tmp, "state")
@@ -57,6 +57,7 @@ class UpgradeTestCase(unittest.TestCase):
         server.PB_URL = "http://127.0.0.1:59999"          # dead port
         server.PB_ENV_PATH = os.path.join(self.tmp, "pb.env")
         server.KILL_FILE = os.path.join(self.tmp, "KILL")  # never the real grid/KILL
+        server.LLM_ENV_PATH = os.path.join(self.tmp, "llm.env")
         server._REL_CACHE = None
         server._GEOM_CACHE = {}
         os.makedirs(server.STATE_DIR, exist_ok=True)
@@ -242,6 +243,36 @@ class UpgradeTestCase(unittest.TestCase):
         self.assertEqual(fast.get("geom"), [])
         self.assertEqual(fast.get("tuned_params"), {})
         self.assertEqual(fast.get("decisions_tail"), [])
+
+    def test_optimizer_reliability_source_declared(self):
+        """The optimizer panel's reliability card must declare its source:
+        when the live ledger (trades DBs) is empty the numbers come from
+        the frozen WT-era file — the UI badges them, so the payload has
+        to say which one it served."""
+        code, body = self.call("/api/optimizer")
+        self.assertEqual(code, 200)
+        fast = body.get("fast") or {}
+        src = fast.get("reliability_source")
+        self.assertTrue(isinstance(src, str) and src)
+        # in the isolated test env nothing live exists → frozen fallback
+        self.assertIn("frozen", src.lower())
+
+    def test_llm_env_keys_parses_export_prefix(self):
+        """state/llm.env is written in `export KEY=…` form. The readiness
+        probe's old hand-rolled parser split raw lines on "=" and left the
+        `export ` prefix on every key — every LLM cell read "down" while
+        live provider pings succeeded. Regression: parse via the canonical
+        _llm_sidecar() and report presence honestly."""
+        with open(server.LLM_ENV_PATH, "w") as f:
+            f.write("# sidecar\n"
+                    "export MISTRAL_API_KEY=\"test-key-not-real\"\n"
+                    "export GRID_LLM_CHAIN=mistral,nvidia\n"
+                    "export NVIDIA_API_KEY=another-not-real\n")
+        keys = server._llm_env_keys()
+        self.assertTrue(keys["MISTRAL_API_KEY"])
+        self.assertTrue(keys["NVIDIA_API_KEY"])
+        self.assertFalse(keys["OPENROUTER_API_KEY"])
+        self.assertFalse(keys["DEEPSEEK_API_KEY"])
 
     def test_position_sweeps_fail_soft_200(self):
         """The sweep-history endpoint reads state.json directly (no ctl

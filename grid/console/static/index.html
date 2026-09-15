@@ -51,10 +51,9 @@
           <div class="card-head"><span class="card-title">Controls</span></div>
           <div class="card-body">
             <div class="ctl-grid">
-              <button class="btn btn--danger" id="ctl-halt" title="Stop the mission stack (engine + console) via grid/dev">Halt mission</button>
-              <button class="btn" id="ctl-unkill" hidden>Clear KILL</button>
               <button class="btn btn--wide" id="ctl-restart">Restart mission</button>
               <button class="btn btn--wide" id="ctl-stop">Stop mission</button>
+              <button class="btn btn--wide" id="ctl-unkill" hidden title="Remove the legacy grid/KILL artifact (a WT-era brain halt flag nothing in the standalone stack reads)">Clear KILL file</button>
             </div>
           </div>
         </div>
@@ -125,7 +124,7 @@
   <section class="view" id="view-optimizer" role="tabpanel" aria-labelledby="tab-optimizer" hidden>
     <div class="view-head">
       <h2>Position optimizer</h2>
-      <span class="sub">No separate optimizer applies in this workspace: GridStrategy revalues the ATR channel and grid lines in-strategy every candle. The panel shows the deployed geometry, the tuned params and the live reliability ledger.</span>
+      <span class="sub">No separate optimizer applies in this workspace: GridStrategy revalues the ATR channel and grid lines in-strategy every candle. The panel shows the deployed geometry, the tuned params and the reliability ledger (live from the trades DBs — or the frozen WT-era file, badged as such, while no trips have closed).</span>
     </div>
     <div class="card" id="opt-fast"></div>
     <p></p>
@@ -189,7 +188,7 @@
   <section class="view" id="view-config" role="tabpanel" aria-labelledby="tab-config" hidden>
     <div class="view-head">
       <h2>Configuration</h2>
-      <span class="sub">Edits write <code class="mono">config.yaml</code> in place (comments preserved, backup kept). The daemon reads config at startup — restart to apply.</span>
+      <span class="sub">Edits write <code class="mono">config.yaml</code> in place (comments preserved, backup kept). Nothing in the standalone stack reads this file at runtime — the fleet is parameterized by <code class="mono">grid/dev</code> constants (slot map, wallets, timeframes) and <code class="mono">GridStrategy.json</code>, and the ladder thresholds are constants in <code class="mono">grid/reliability/ledger.py</code>. Edits persist for the future autonomy brain (M3).</span>
     </div>
     <div id="config-banner"></div>
     <div class="banner-slot" id="cfg-freshness"></div>

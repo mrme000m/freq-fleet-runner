@@ -1,72 +1,59 @@
-# grid-autonomy console — observe · configure · control
+# grid fleet console — observe · configure · maintain
 
-A self-contained web console for the autonomous grid-trading daemon:
-a stdlib-only backend (`server.py`) that reads the daemon's state
-artifacts, proxies its ctl plane, and adds safe config editing + daemon
-lifecycle control — plus a vanilla JS/HTML/CSS frontend (`static/`).
-The daemon itself is untouched; the console is purely additive and
-fail-soft (it renders last-persisted state even when the daemon is down).
+The mission console for the **standalone freqtrade dry-run grid fleet**: a
+stdlib-only backend (`server.py`) that reads workspace artifacts (the
+fleet's trades DBs, the engines' own local REST APIs, `state/*` snapshots)
+plus a vanilla JS/HTML/CSS frontend (`static/`). The WT-era autonomy brain
+was retired with the WunderTrading engine (2026-09-15) — the console now
+serves live freqtrade-fleet truth end to end and is purely additive and
+fail-soft.
 
 ```
 browser ── http://127.0.0.1:8798 ──> console/server.py
-                                      ├─ reads  state/{state.json, decisions.jsonl,
-                                      │         reliability.json, reports/, daemon.log}
-                                      ├─ proxies daemon ctl :8799 (rescreen/rotate/kill…)
-                                      ├─ edits  config.yaml (whitelist, comments preserved)
-                                      └─ controls daemon lifecycle (launchd-aware)
+                                      ├─ reads   state/ft_fleet/<bot>/tradesv3.dryrun.sqlite
+                                      │          (sqlite, read-only) + registry.json,
+                                      │          state/engine.json, state/llm.env
+                                      ├─ probes  each freqtrade engine's local REST
+                                      │          (:8191+, HTTP Basic, 30s TTL + per-endpoint
+                                      │          60s back-off) for marks/balance/candles
+                                      ├─ edits   config.yaml (whitelist, comments preserved)
+                                      └─ controls lifecycle via grid/dev (console + engines)
 ```
+
+The retired daemon ctl plane (`:8799`) is **not** proxied anymore
+(`CTL_RETIRED = True` in `server.py`): every former ctl consumer builds
+its payload from workspace artifacts instead. `/api/observe` and
+`/api/status` degrade fail-soft.
 
 ## Run
 
 ```sh
-cd agents/grid-autonomy
-./dev start                    # starts the console with the whole stack
-./dev restart console          # restart JUST the console — required after
-                                # changing console/server.py or static/*:
-                                # the console is a long-lived launchd process
-                                # and only a process restart reloads its code
-                                # (daemon restarts alone leave it stale)
-python3 console/server.py      # standalone: http://127.0.0.1:8798
-CONSOLE_PORT=8800 python3 console/server.py   # override port
+grid/dev start                  # whole stack: console + PB (:8290) + 4 dry-run engines
+grid/dev stop --keep-ft --keep-pb   # stop JUST the console (engines keep trading)
+grid/dev start --no-ft          # console-only restart — required after changing
+                                # console/server.py (statics are served from disk
+                                # per request, so frontend edits live on refresh;
+                                # server.py edits need the process restart)
+python3 console/server.py       # standalone: http://127.0.0.1:8798
+GRID_BIND_HOST=0.0.0.0 …        # container override; local default stays loopback-only
 ```
 
 Stdlib only — no pip installs, no build step. Binds `127.0.0.1` only.
-The console itself queries the daemon ctl plane (`:8799`) per request —
-it reconnects automatically after daemon restarts, so a brief
-`ctl offline` in the statusbar during a restart is expected and
-self-heals within one 5 s poll.
-
-Under `scripts/install_launchd.sh` the console is supervised as
-`com.tvcli.grid-autonomy-console` (via `scripts/run_console.py`, stdio
-redirected in-process to `state/logs/console.log`); SIGTERM exits 0 so
-`dev stop` keeps it stopped instead of restart-looping. The **Dev
-maintenance** panel (Fleet view rail) runs the single `dev` script
-detached: `POST /api/dev/reset`, `/api/dev/reset-wt`, `/api/dev/clean`
-(confirm-gated; output in `state/logs/dev.log`; `reset`/`reset-wt` stop the
-console itself, so the frontend reloads after a few seconds).
-
-The console can run (and show last-persisted state) whether the daemon is
-up or down; live values (status chips, ladder cursors, feed) update every
-5s while the page is visible.
-
-**Two WunderTrading accounts.** The header subtitle and the fleet-summary
-"WT account" row show which WT account this instance trades on: the
-deployment (VPS container — vault item `wundertrading` in folder
-`grid-autonomy`) and the Mac's local daemon run on **two separate
-WunderTrading accounts**. Override the label with `WT_ACCOUNT_LABEL` env;
-default is `vps (vault account)` inside the container (detected via
-`/.dockerenv`) and `local (Mac account)` otherwise.
+Live values (status chips, marks, feed) update every 5s while the page is
+visible; the LLM provider ping and the reliability ledger are 60s-cached
+server-side (M4 pairing is not free).
 
 ## The UI
 
 | View | What it shows / does |
 |------|----------------------|
-| **Fleet** | One card per slot. Active bots render a **channel ladder** — the bot's actual ATR channel (`low/mid/high`) with its geometric grid rungs and a live price cursor (crimson flag when out of channel). Fills vs stagnation floor, unrealized PnL, commitment, hold time, stagnant/adopted/rotate-queued badges. Right rail: control actions, live journal feed, last screen shortlist, fleet summary. A **readiness strip** on top shows the daemon's own dependency diagnostics — LLM provider env per chain link, browser CDP, PocketBase, enforced venue capacity (non-premium/premium active vs max, from the ctl plane's capacity view), connected profiles (any real-money `paperTrading=false` profile is flagged red), and worker capabilities. |
-| **Decisions** | The full `decisions.jsonl` ledger — every deliberate → guard → deploy call with regime, score, step, slot, LLM-degraded flag, rationale, and the outcome (realized PnL) attached on close. Filter by text/state. |
-| **Run cards** | Index of `state/reports/`; each card opens the rendered markdown (Route/Ground/Deliberate/Guard/Deploy/Observe/Reflect/Caveats) with the raw JSON behind a toggle. |
-| **Reliability** | Per-archetype ledger with sizing-tier computation (base <10 samples → probe ≥10 → full ≥30 & PF ≥1.3; recent PF <1.0 kills) and a progress track to the 30-sample gate. |
-| **Config** | Whitelisted knobs (portfolio, cadence, policy, sizing ladder, memory) edited in place — comments preserved, rolling `.bak` kept, round-trip verified before write. Everything else (incl. `autonomy.live_profiles`) is read-only by design; the daemon reads config at startup, so edits prompt a restart. |
-| **Logs** | `daemon.log` tail with grep + follow. |
+| **Fleet** | One live card per freqtrade instance: registry identity, engine-REST marks, trades-DB counts/realized, and the grid channel recomputed exactly the way GridStrategy does it (vendored geometry + tuned params + last analyzed candle — never persisted by the strategy, so nothing on disk is trusted for it). Status is three-state (running / starting / down, with an `api_backoff` tooltip while REST is in a 429/warm-up back-off). Inline 5m sparklines (tvcli/Binance market data; keyboard-openable market modal with channel refs), an honest "no market feed" note for symbols with no TV pair (HYPE). Right rail: lifecycle controls (Restart / Stop mission; Clear KILL only when the legacy artifact exists), live engine-event feed, LLM provider brains, fleet summary. A readiness strip on top probes engines, `.venv-ft`, strategy files, PocketBase (legacy, unused) and LLM env keys. |
+| **Decisions** | The live engine decision stream — grid-line fills, trade opens and closes, derived per instance from `tradesv3.dryrun.sqlite`. Text filter. The WT-era `state/decisions.jsonl` ledger is preserved on disk but no longer rendered (no writer since the brain retired). |
+| **Run cards** | The live engine session (per-instance status, trades, marks, channel, wallet). The WT-era `state/reports/` archive is preserved on disk and no longer displayed. |
+| **Optimizer** | Not applicable in this workspace (GridStrategy revalues the channel in-strategy every candle) — the panel shows the deployed live geometry, the M2-hyperopt tuned params, and the reliability ledger **with an explicit provenance badge** ("live · trades DBs" vs "frozen WT-era file" when the live ledger is empty). |
+| **Reliability** | Live M4 ledger computed from the fleet's trades DBs (pairing → ledger math), sizing-ladder thresholds pinned at top, per-archetype expandable round-trips; the frozen WT-era `state/reliability.json` snapshot renders as a clearly-labeled secondary card while the file exists. Auto-refreshes every 30s. |
+| **Config** | Whitelisted knobs (portfolio, cadence, policy, sizing ladder, optimizer) edited in place — comments preserved, rolling `.bak`, round-trip verified. **Honest by design:** nothing in the standalone stack reads `config.yaml` at runtime (fleet params come from `grid/dev` constants + `GridStrategy.json`; ladder thresholds are constants in `grid/reliability/ledger.py`) — edits persist for the future autonomy brain (M3), and no restart "applies" them. LLM provider keys/models/chain/role-routing persist to `state/llm.env` (0600; keys never echo). |
+| **Logs** | Workspace-tail: every live log file under `state/logs/` merged, grep + follow, append-only diffing with highlighted new lines. |
 
 ## API
 
@@ -74,59 +61,61 @@ Everything the UI does is a plain JSON endpoint (safe to curl):
 
 | Method | Path | Effect |
 |--------|------|--------|
-| GET | `/api/overview` | Merged snapshot: daemon info, ctl status, enriched bots, slots, committed, journal tail, reliability, last screen, config digest, PB health, readiness (derived dependency/capacity/profile diagnostics). |
-| GET | `/api/daemon` | Supervisor/lifecycle detail (pid, mode, launchd vs manual, uptime, KILL). |
-| GET | `/api/state` | Raw `state.json`. |
-| GET | `/api/journal?limit=` | Journal tail. |
-| GET | `/api/decisions?limit=` | Decisions, newest first, outcomes included. |
-| GET | `/api/reliability` | Ledger + tier computation + ladder thresholds. |
-| GET | `/api/screen` | Latest rescreen run-card extract (top candidates). |
-| GET | `/api/reports` · `/api/reports/<stem>` | Run-card index / one card `{json, md}`. |
-| GET | `/api/logs?lines=&grep=` | `daemon.log` tail. |
-| GET | `/api/config` | Parsed `config.yaml` + editable whitelist. |
-| GET | `/api/observe` | Proxy of daemon ctl `/observe`. |
-| GET | `/api/meta` | Ports, paths, `wt_account` (WT account label — VPS/vault vs local). |
-| POST | `/api/ctl/rescreen` | Queue immediate rescreen. |
-| POST | `/api/ctl/reliability` | Queue reliability refresh. |
-| POST | `/api/ctl/rotate` `{"slot": n}` | Force-rotate a slot. |
-| POST | `/api/ctl/kill` `{confirm}` | Write the KILL file. |
-| POST | `/api/ctl/unkill` `{confirm}` | Remove the KILL file. |
+| GET | `/api/overview` | Merged snapshot: daemon (grid/dev supervision of the console), engine declaration, live ft_fleet instances (enriched), readiness, journal tail (live engine events), reliability, config digest, PB health. |
+| GET | `/api/daemon` | Supervisor/lifecycle detail (pid, mode, kill-file, uptime). |
+| GET | `/api/state` · `/api/journal` | Raw `state.json` / journal tail (WT-era artifacts, fail-soft). |
+| GET | `/api/decisions?limit=` | Frozen WT-era decisions + `engine_events` (live fills/opens/closes) + freshness. |
+| GET | `/api/reliability` · `/api/reliability/archive?limit=` | Live M4 ledger (ladder, kill thresholds, freshness, WT-era file snapshot) / per-archetype closed round-trips. |
+| GET | `/api/optimizer` | `{optimizer: null, applicable: false, reason, fast}` — `fast` carries the live geometry, tuned params, reliability + `reliability_source`, and the frozen decisions tail. |
+| GET | `/api/llm/health` · `/api/llm` | Live provider pings + role routing (60s cache) / sidecar state for the editor. |
+| GET | `/api/chart?venue=&symbol=&interval=&bars=` | tvcli/Binance candle proxy (`1m|3m|5m|15m|1h|4h|1d`; errors cached 60s). |
+| GET | `/api/pnl` | Fleet-cumulative PnL timeline from the trades DBs + a trailing live mark point. |
+| GET | `/api/reports` | Live engine session + WT-era report index (frozen, freshness-labeled). |
+| GET | `/api/logs?lines=&grep=` | Workspace log-tail (per-source mtimes included). |
+| GET | `/api/config` | Parsed `config.yaml` + editable whitelist + freshness. |
+| GET | `/api/meta` | Ports, paths, engine declaration. |
 | POST | `/api/config` `{"edits": {path: value}}` | Apply whitelisted edits (backup + round-trip check). |
-| POST | `/api/daemon/stop` `{confirm, force}` | KILL + SIGTERM (+SIGKILL with force). |
-| POST | `/api/daemon/start` `{confirm, live_paper, clear_kill}` | `scripts/start.sh`, optionally `--live-paper`. |
-| POST | `/api/daemon/restart` `{confirm, clear_kill}` | launchd kickstart (supervised) or stop+start. |
-| POST | `/api/dev/reset` `{confirm, keep_decisions, wt, start}` | run `dev reset` detached — wipes runtime state, stops the stack; `wt: true` also deletes all WunderTrading paper bots (explicit, never defaulted). |
-| POST | `/api/dev/reset-wt` `{confirm}` | run `dev reset-wt` detached — deletes all WT paper bots + clears daemon bot state. |
-| POST | `/api/dev/clean` `{confirm}` | run `dev clean` detached — clears logs + runtime artifacts. |
+| POST | `/api/llm` · `/api/llm/validate` | Persist `state/llm.env` / live-validate all providers. |
+| POST | `/api/ctl/kill` `{confirm}` | Write the legacy `grid/KILL` file — **kept for API compat only; nothing in the standalone stack consumes it** (the WT-era brain did). The UI surfaces it only as a clearable legacy artifact. |
+| POST | `/api/ctl/unkill` `{confirm}` | Remove the legacy KILL file. |
+| POST | `/api/daemon/stop` `{confirm, force}` | `grid/dev stop` (detached so the response flushes; `force` also SIGKILLs the console). |
+| POST | `/api/daemon/start` `{confirm, live_paper, clear_kill}` | `grid/dev start` (`live_paper` accepted for compat, ignored — dry-run only). |
+| POST | `/api/daemon/restart` `{confirm, clear_kill, live_paper}` | `grid/dev` stop+start in the background. |
+| POST | `/api/dev/reset` · `/api/dev/reset-wt` · `/api/dev/clean` `{confirm, …}` | Run the single `dev` script detached (confirm-gated; output in `state/logs/dev.log`; `reset`/`reset-wt` stop the console itself, so the frontend reloads after a few seconds). |
 
 ### Safety model
 
 - **127.0.0.1 only**; cross-origin POSTs are refused.
-- Destructive calls (`kill`, `stop`, `restart`) require `{"confirm": true}`
-  — the UI backs these with explicit confirm dialogs.
+- Destructive calls (`stop`, `restart`, `reset*`, `clean`) require
+  `{"confirm": true}` — the UI backs these with explicit confirm dialogs.
 - Config edits are restricted to a **whitelisted, range-checked** set of
-  numeric knobs; `autonomy.live_profiles` / `paper_profiles` are
+  numeric/bool knobs; `autonomy.live_profiles` / `paper_profiles` are
   deliberately not editable from the console. Every write is
   comment-preserving (`yaml_edit.py`), round-trip verified against the
   YAML parser, and leaves `config.yaml.bak`.
-- A KILL file is never cleared implicitly — `start`/`restart` refuse with
-  `kill_present: true` unless the request explicitly passes `clear_kill`.
-- The console never talks to WunderTrading directly; every trading action
-  still flows through the daemon's guardrailed ctl plane.
+- LLM keys are read from `state/llm.env` (0600) and only ever surface as
+  presence booleans / masked inputs — never in any payload or log.
+- Engine REST credentials live only in `state/ft_fleet/registry.json` +
+  each instance's `config.json`; the console uses them for the
+  Authorization header only and never returns them.
+- The console never talks to any exchange directly; market data comes
+  through the tvcli proxy and trade state through the local engines and
+  their sqlite artifacts. Everything here is dry-run.
 
 ## Files
 
 | Path | Role |
 |------|------|
-| `server.py` | HTTP backend: static serving, read-only state APIs, ctl proxy, config editor, daemon lifecycle ops. |
+| `server.py` | HTTP backend: static serving, live-fleet APIs, chart proxy, config editor, grid/dev lifecycle ops. |
 | `yaml_edit.py` | Path-aware, comment-preserving YAML leaf editor (block + one flow level). |
 | `static/index.html` · `static/app.js` · `static/styles.css` | The frontend — vanilla, no dependencies, no build step. |
-| `../tests/test_console.py` | Offline unit + HTTP tests (part of the daemon suite). |
+| `test_upgrade.py` | Offline unit + HTTP tests (isolated tmp state dir; never touches the real grid/KILL or fleet DBs). |
 
 ## Tests
 
 ```sh
-cd agents/grid-autonomy
-python3 -m unittest tests.test_console        # console only
-python3 -m unittest discover -s tests -t .    # full suite (all offline)
+python3 console/test_upgrade.py          # from grid/ (or any absolute path) — 14 tests
 ```
+
+See `../docs/console-review-fixes-2026-09-15.md` for the recorded review
+passes (misalignments found + fixed, verified live).

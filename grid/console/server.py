@@ -2569,26 +2569,20 @@ def _strategy_files_present() -> bool:
 
 def _llm_env_keys() -> dict:
     """Bool map of which LLM provider keys are present in state/llm.env or
-    process env. Same shape as the legacy daemon_cshape the readiness strip
+    process env. Same shape as the legacy daemon shape the readiness strip
     used to render.
+
+    Reuses _llm_sidecar() — the sidecar file is written in `export KEY=…`
+    form, and this probe used to split raw lines on "=" itself, leaving the
+    `export ` prefix on every key so ALL cells read "down" while the live
+    provider pings succeeded. One parser, no drift.
     """
     candidates = ("MISTRAL_API_KEY", "OPENROUTER_API_KEY", "NVIDIA_API_KEY",
                   "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+    side = _llm_sidecar()
     out = {}
-    # prefer llm.env over process env (it's where the daemon reads from)
-    llm_env_path = os.path.join(STATE_DIR, "llm.env")
-    llm_lines = {}
-    try:
-        with open(llm_env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    llm_lines[k.strip()] = v.strip().strip('"').strip("'")
-    except OSError:
-        pass
     for k in candidates:
-        v = llm_lines.get(k) or os.environ.get(k) or ""
+        v = side.get(k) or os.environ.get(k) or ""
         out[k] = bool(v and v not in ("", "changeme", "your-key"))
     return out
 
@@ -2641,10 +2635,16 @@ def _optimizer_standalone_payload() -> dict:
                                     "GridStrategy.json"), {}) or {}
 
     # Reliability summary — live from the fleet's trades DBs (M4 math),
-    # falling back to the WT-era file ledger only while it still exists
-    rel = (_reliability_live().get("ledger")
+    # falling back to the WT-era file ledger only while it still exists.
+    # The source is declared so the panel can label the numbers honestly:
+    # an empty live ledger silently showing the frozen file was read as
+    # "live context" by the Optimizer tab.
+    live_rel = _reliability_live().get("ledger")
+    rel = (live_rel
            or _read_json(os.path.join(STATE_DIR, "reliability.json"), {})
            or {})
+    rel_source = ("engine trades DBs (live)" if live_rel
+                  else "state/reliability.json (frozen WT-era file)")
 
     # Decision journal tail (state/decisions.jsonl) — last 5 entries.
     decisions = []
@@ -2667,6 +2667,7 @@ def _optimizer_standalone_payload() -> dict:
         "geom": geom,
         "tuned_params": tuned,
         "reliability": rel,
+        "reliability_source": rel_source,
         "decisions_tail": decisions,
         "note": "GridStrategy handles per-candle grid revaluation in-strategy; "
                 "geom[] is recomputed live from the engine's last analyzed "

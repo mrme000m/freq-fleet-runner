@@ -7,6 +7,90 @@ below was verified live after a console-only restart
 (`grid/dev stop --keep-ft --keep-pb` → `start --no-ft`); engines kept
 trading throughout.
 
+## Second pass (same day, later) — new findings
+
+The first pass (§1-8 below) fixed the ctl-plane fusion, sparkline interval
+drift, TF lies, PnL sawtooth and freshness bugs. A second full pass found
+what was still off:
+
+1. **"Halt mission" was a placebo** — it wrote `grid/KILL`, the WT-era
+   brain's halt flag, but nothing in the standalone stack reads that file
+   (`grid/dev` never does; `grep` confirms no consumer). The confirm
+   dialog even claimed "the daemon halts at the next loop tick". Retired
+   the button and the always-green "KILL clear" statusbar chip; a KILL
+   file now surfaces as an honest *legacy artifact* banner + warn chip +
+   a Clear-KILL button (in the controls card and the banner) only when
+   the file actually exists. `/api/ctl/kill|unkill` stay for API compat
+   (pinned by `test_ctl_kill_is_local_file_only`).
+2. **Readiness LLM cells all read "down" while pings succeeded** —
+   `_llm_env_keys()` hand-parsed `state/llm.env` without stripping the
+   `export ` prefix, so `"export MISTRAL_API_KEY"` never matched the
+   candidate key. The sidecar's canonical parser (`_llm_sidecar()`)
+   handles it; the probe now reuses it. Regression test added.
+3. **Instance cards showed a stale channel band next to a "live" badge**
+   — `renderFleetInstances`' change-signature omitted
+   `channel_live.low/high/mid` (+`api_backoff`), so a drifting ATR band
+   with unchanged grid count never re-rendered the row it labeled "live".
+   Sig now covers every painted field.
+4. **The Optimizer tab presented the frozen WT-era ledger as live
+   context** — when the live ledger is empty, the server silently falls
+   back to `state/reliability.json` (the panel copy even said "the live
+   reliability ledger"). The payload now declares
+   `fast.reliability_source` and the card carries a provenance badge
+   ("live · trades DBs" / "frozen WT-era file").
+5. **The Config tab claimed a daemon reads config.yaml at startup** —
+   nothing in the standalone stack does (fleet params are `grid/dev`
+   constants + `GridStrategy.json`; ladder thresholds are constants in
+   `grid/reliability/ledger.py`). Tab copy, post-save banner (and its
+   placebo "Restart daemon" button) and the freshness banner ("fresh" at
+   9.6h old) are all honest now.
+6. **Reliability and Run-cards tabs never auto-refreshed** — despite the
+   Reliability copy saying the ledger "fills live from the trades DBs".
+   Both poll every 30s now (Config/LLM stay click-only — a poll would
+   clobber in-progress edits).
+7. **PnL header passed one slot's wallet off as the fleet's** —
+   "dry-run wallet $149.89" was the first running instance's balance.
+   Now the fleet sum with a `n/N reporting` note for engines in REST
+   back-off.
+8. **Feedless symbols retried forever and spun the market modal** —
+   HYPE (no Binance/TV pair) re-fetched every 5s poll and showed a 12s
+   spinner ending in a misleading "no chart data cached … yet". Failures
+   are remembered feedless for 5min (success clears), the modal says the
+   honest thing immediately, a fetch *timeout* no longer strands the
+   spinner (unhandled rejection fixed), and a card re-render repaints
+   the no-feed note (regression guard against the sig fix of §3).
+9. **`renderLlmBrains` re-fetched + re-rendered every 5s poll** — now
+   60s-throttled + in-flight-guarded, matching the server's 60s ping
+   cache.
+10. **UI/UX + a11y**: PnL canvas now draws at the chart cell's rendered
+    width (was a fixed 360px in a much wider cell); sparklines are
+    keyboard-openable (role=button, tabIndex, Enter/Space, aria-label —
+    the CSS focus outline already existed); tabs use the WAI-ARIA roving
+    tabindex; engine-event kinds got the colors the WT-era kinds had
+    (feed + decisions badges: open=teal, fill=violet, close=amber);
+    channel prices use magnitude-aware `fmtPrice` (0-decimals was lossy
+    on low-price pairs) with a null-guard; `dev clean` no longer
+    force-reloads the page (the console doesn't restart for clean);
+    PB chip says "pocketbase up (legacy)" instead of "PB journal up".
+11. **Dead code pruned**: `estimateCloseBy`, `heldFor` (WT-era bot-card
+    helpers), `blockedByBadge` (WT-era rec tables), `confirmDialog`'s
+    never-used `checkbox2`. `console/README.md` still described the
+    WT-era console (daemon-ctl proxy, launchd, WT accounts,
+    `../tests/test_console.py`) — rewritten to the standalone reality.
+
+Tests: 14/14 (`test_optimizer_reliability_source_declared` +
+`test_llm_env_keys_parses_export_prefix` added; suite renumbered).
+Verified live post-restart in a real browser: statusbar chips (no placebo
+KILL chip, honest PB chip), readiness LLM cells up (Mistral/OpenRouter/
+NVIDIA present, others honestly down), fleet wallet "$449 (3/4
+reporting)", channel rows with full-precision prices, BTC/ETH/SOL
+sparklines painted + HYPE honest no-feed note, Optimizer provenance badge
+"frozen WT-era file", Config honest copy + "config.yaml — last write"
+banner, colored decisions badges, responsive PnL canvas at 793px.
+Engines traded throughout (fills grew during the pass).
+
+## First pass — original findings
+
 ## 1. The console had fused to the M3 companion daemon (critical)
 
 `_ctl()`/`_ctl_cached()` proxy `:8799`. The WT-era brain that used to own

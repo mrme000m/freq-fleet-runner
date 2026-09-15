@@ -144,6 +144,8 @@ a { color: var(--teal-deep); }
 
 .chip--ok .dot { background: var(--teal); }
 .chip--warn .dot { background: var(--amber); }
+.chip--warn { border-color: var(--amber); color: var(--amber); background: var(--amber-wash); }
+.chip--warn b { color: var(--amber); }
 .chip--bad .dot { background: var(--crimson); }
 .chip--bad { border-color: var(--crimson); color: var(--crimson); background: var(--crimson-wash); }
 .chip--bad b { color: var(--crimson); }
@@ -666,6 +668,10 @@ a { color: var(--teal-deep); }
 .k--stagnant, .k--warn, .k--health-warn, .k--adjust-skip, .k--adopt-warn,
 .k--rotation-warn, .k--rotation-skip, .k--capacity-veto { color: var(--amber); }
 .k--reliability, .k--subscription, .k--adjust, .k--cycle, .k--regime-changed { color: var(--violet); }
+/* live engine decision stream (the standalone journal tail) */
+.k--engine-fill { color: var(--violet); }
+.k--engine-open { color: var(--teal-deep); }
+.k--engine-close { color: var(--amber); }
 
 /* ── tables (decisions, reliability, reports) ────────────────────── */
 
@@ -1516,7 +1522,9 @@ table.ledger tr:hover td { background: rgba(10, 126, 109, 0.045); }
   min-width: 0;
 }
 
-.pnl-chart canvas { display: block; max-width: 100%; }
+/* width:100% — drawPnlChart measures clientWidth and sizes the backing
+   bitmap to the cell (device-pixel-ratio aware); height stays fixed 96 */
+.pnl-chart canvas { display: block; width: 100%; max-width: 100%; }
 
 /* ── veto / system-health strip ───────────────────────────────────── */
 
