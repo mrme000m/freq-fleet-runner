@@ -18,8 +18,19 @@ M5 profitability pass (see docs/reliability-ledger.md §"Finding"):
     step to clear fees (min_atr_pct floor + min_step_multiple × cost) or
     in a confirmed downtrend (close below EMA26 by trend_tolerance_pct).
   * downside exit + recenter cooldown.
-  * bounded line refill (max_refills_per_line) with a tightened re-buy
-    window so refills stay far enough below TP to clear fees.
+  * bounded line refill (max_refills_per_line); every buy window (fresh
+    line and refill alike) is capped where the line's TP still clears the
+    round-trip cost, so no fill can be fee-negative churn.
+  * confirm-then-mutate line state (2026-09-15 desync fix): `filled` /
+    `refills` change ONLY in order_filled (freqtrade's fill
+    confirmation) — never at adjust_trade_position decision time, where a
+    decided sell can still be vetoed by freqtrade's remaining-position
+    minimum or a placed order can time out unfilled. Decision-time
+    mutation produced phantom sold lines, double inventory and sells of
+    never-bought inventory in the live dry-run. adjust_trade_position
+    derives pending (open, unfilled) grid orders from trade.orders and
+    skips those lines, and pre-checks the remaining-position veto so a
+    decided exit is one freqtrade will actually place.
   * grid state persists to <user_data_dir>/grid_state.json and is
     restored on bot_start so a restart mid-trade keeps its fills.
   * alloc_usd / min_cost / spread_pct are hyperoptable; alloc_usd scales
@@ -203,6 +214,10 @@ class GridStrategy(IStrategy):
         # pair -> datetime: block new entries until this candle timestamp
         # (downside-exit cooldown so we don't instantly recenter a break)
         self._recenter_block_until: dict = {}
+        # order_ids whose fill effect order_filled has already applied
+        # (order_filled fires once per order; the guard is just belt and
+        # braces against double invocation in odd exchange paths)
+        self._applied_fills: set = set()
 
     # --- helpers -----------------------------------------------------
 
@@ -257,6 +272,67 @@ class GridStrategy(IStrategy):
     def _lines_below_mid(self, state: dict) -> int:
         mid = (state["low"] + state["high"]) / 2.0
         return sum(1 for ln in state["lines"] if ln < mid)
+
+    # --- order-confirmed line bookkeeping (desync fix) -----------------
+
+    def _grid_tag_line(self, order) -> int | None:
+        """Line index encoded in a grid order tag (grid_buy_Li /
+        grid_sell_Lj); None for every other order (the initial
+        grid_recenter entry, channel exits, stoploss)."""
+        tag = getattr(order, "ft_order_tag", None) or ""
+        if not (tag.startswith("grid_buy_L") or tag.startswith("grid_sell_L")):
+            return None
+        try:
+            return int(tag.rsplit("L", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
+    def _pending_line_orders(self, trade) -> dict:
+        """line index -> {open order sides} from the trade's own order
+        book. freqtrade calls adjust_trade_position every loop even while
+        orders rest open, so without this a resting (unfilled) grid order
+        would be re-decided and duplicated on the next candle."""
+        pending: dict = {}
+        for o in getattr(trade, "orders", None) or []:
+            if not getattr(o, "ft_is_open", False):
+                continue
+            idx = self._grid_tag_line(o)
+            if idx is None:
+                continue
+            pending.setdefault(idx, set()).add(getattr(o, "ft_order_side", ""))
+        return pending
+
+    def _min_exit_stake(self, min_stake) -> float:
+        """freqtrade's remaining-position minimum for a partial exit.
+
+        freqtradebot.check_and_call_adjust_trade_position vetoes any
+        reduce whose remaining position falls below
+        get_min_pair_stake_amount(pair, exit_rate, stoploss, leverage) —
+        the pair minimum scaled by the stoploss reserve 1/(1-|stoploss|)
+        (exchange.py _get_stake_amount_limit). The `min_stake` handed to
+        adjust_trade_position is the ENTRY-side minimum (stoploss 0.0),
+        so the exit-side bar is that value rescaled; estimate 2% high —
+        over-skipping merely retries a later candle, and with
+        confirm-then-mutate a missed estimate can no longer desync line
+        state."""
+        if not min_stake:
+            return 0.0
+        return float(min_stake) / (1.0 - abs(self.stoploss)) * 1.02
+
+    def _sell_viable(self, trade, per_line, current_exit_rate, min_stake,
+                     max_stake) -> bool:
+        """Would freqtrade actually place this partial exit? Mirrors the
+        veto computation in freqtradebot (proportional base amount, then
+        remaining-position minimum) so adjust_trade_position never
+        returns a decision the bot silently drops."""
+        bar = self._min_exit_stake(min_stake)
+        if not bar or not trade.stake_amount:
+            return True
+        sell_stake = min(per_line, max_stake)
+        amount = sell_stake * trade.amount / trade.stake_amount
+        remaining = (trade.amount - amount) * current_exit_rate
+        # remaining == 0 is a full close — always allowed
+        return remaining == 0.0 or remaining >= bar
 
     # --- grid-state persistence (live/dry-run restarts) --------------
 
@@ -456,6 +532,13 @@ class GridStrategy(IStrategy):
                               current_entry_profit: float,
                               current_exit_profit: float,
                               **kwargs):
+        """Decide the next grid order for an open trade. DECISION ONLY:
+        this method must never mutate `filled` / `refills` — a decided
+        order can still be vetoed by freqtrade (remaining-position
+        minimum) or time out unfilled, and mutating here desynced line
+        state from real inventory (2026-09-15 dry-run: 8 vetoed sells,
+        phantom refills, sells of never-bought lines). Line state moves
+        only in order_filled, on freqtrade's fill confirmation."""
         state = self._grid_state(trade.pair)
         if state is None:
             return None
@@ -472,55 +555,93 @@ class GridStrategy(IStrategy):
         if min_stake and per_line < min_stake:
             per_line = min_stake
         step = state["step_pct"]
+        pending = self._pending_line_orders(trade)
 
         # --- GRID SELL (checked first) ---
-        # highest filled line whose TP is reached
+        # highest filled line whose TP is reached and which has no
+        # resting sell order already working that level
         best_j = None
         for j, ln in enumerate(lines):
-            if j in filled:
+            if j in filled and "sell" not in pending.get(j, ()):
                 if current_exit_rate >= ln * (1 + step / 100.0):
                     if best_j is None or lines[best_j] < ln:
                         best_j = j
         if best_j is not None:
-            filled.discard(best_j)
-            refills[best_j] = refills.get(best_j, 0) + 1
-            self._save_grid_state()
+            if not self._sell_viable(trade, per_line, current_exit_rate,
+                                     min_stake, max_stake):
+                # freqtrade would veto the reduce below its
+                # remaining-position minimum; keep the line filled and
+                # retry once more inventory (or price movement) allows it.
+                return None
             stake = -min(per_line, max_stake)
             return (stake, f"grid_sell_L{best_j}")
 
         # --- GRID BUY ---
         max_buys = self._lines_below_mid(state)
-        if len(filled) >= max_buys:
+        pending_buys = {i for i, sides in pending.items() if "buy" in sides}
+        if len(filled | pending_buys) >= max_buys:
             return None
         if current_entry_rate > lines[-1]:
             # price above the channel top: channel_top_exit fires this very
             # candle, so buying now would be exited flat in the same candle
             return None
-        # Highest line whose buy window contains the current price. Fresh
-        # lines use the full window (line, tp); refilled lines use only the
-        # lower half (line, line*(1+step/2)) so a re-buy sits far enough
-        # below its TP to clear fees on the next sell (buying at the TP
-        # edge is fee-negative churn). Bounded by max_refills_per_line.
+        # Fee-viable buy window: a grid buy fills at the CURRENT rate
+        # somewhere inside the line's window, while its TP is fixed at
+        # line * (1 + step). Filling near the TP edge harvests less than
+        # the round-trip cost (fee-negative churn — the M5 fee bar), so
+        # every window (fresh line AND refill) is capped at the price
+        # where the TP still clears the cost. The entry gate already
+        # guarantees step >= min_step_multiple x cost, so this headroom
+        # is positive for any grid the gate let through.
+        headroom = step - self._cost_floor()
+        if headroom <= 0.0:
+            return None
+        # Highest line whose buy window contains the current price.
+        # Bounded by max_refills_per_line.
         best_i = None
         for i, ln in enumerate(lines):
-            if i in filled:
+            if i in filled or i in pending_buys:
                 continue
             n_refills = refills.get(i, 0)
             if n_refills >= self.max_refills_per_line:
                 continue
-            tp = ln * (1 + step / 100.0)
-            upper = ln * (1 + step / 2 / 100.0) if n_refills else tp
+            upper = ln * (1 + headroom / 100.0)
             if ln < current_entry_rate < upper:
                 if best_i is None or lines[best_i] < ln:
                     best_i = i
         if best_i is None:
             return None
-        new_total = trade.stake_amount + per_line
+        # reserve room for the pending buys' notional too — their stake
+        # is not in trade.stake_amount until they fill
+        new_total = trade.stake_amount + per_line * (1 + len(pending_buys))
         if max_stake and new_total > max_stake:
             return None
-        filled.add(best_i)
-        self._save_grid_state()
         return (per_line, f"grid_buy_L{best_i}")
+
+    def order_filled(self, pair: str, trade: Trade, order, current_time: datetime,
+                     **kwargs) -> None:
+        """Confirm-then-mutate: apply a grid fill to the line state only
+        here, where freqtrade reports the order actually filled (entry,
+        exit and position-adjustment orders alike — live, dry-run and
+        backtest all route through this callback)."""
+        state = self._grid_state(pair)
+        if state is None:
+            return
+        oid = getattr(order, "order_id", None)
+        if oid is not None:
+            if oid in self._applied_fills:
+                return
+            self._applied_fills.add(oid)
+        idx = self._grid_tag_line(order)
+        if idx is None or idx >= len(state["lines"]):
+            return
+        if order.ft_order_side == "buy":
+            state["filled"].add(idx)
+            self._save_grid_state()
+        elif order.ft_order_side == "sell":
+            state["filled"].discard(idx)
+            state["refills"][idx] = state["refills"].get(idx, 0) + 1
+            self._save_grid_state()
 
     def custom_exit(self, pair: str, trade: Trade, current_time: datetime,
                     current_rate: float, current_profit: float,

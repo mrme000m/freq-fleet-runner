@@ -569,6 +569,7 @@ def pnl_payload() -> dict:
     # plotted them as one line and sawtoothed between bots' own sums.
     events = []          # (close_date, profit, bot_code) — raw db strings
     fleet_unrealized = 0.0
+    fleet_open_realized = 0.0
     has_live_mark = False
     for code, entry in (_ft_registry().get("instances") or {}).items():
         if not isinstance(entry, dict):
@@ -585,6 +586,12 @@ def pnl_payload() -> dict:
                     events.extend(
                         (at, float(profit or 0.0), code)
                         for at, profit in cur.fetchall())
+                    # realized banked inside still-open grid trades
+                    # (partial exits) — realized_profit is the cumulative
+                    cur.execute("SELECT coalesce(sum(realized_profit), 0) "
+                                "FROM trades WHERE is_open=1")
+                    fleet_open_realized += \
+                        float(cur.fetchone()[0] or 0.0)
                 finally:
                     con.close()
             except Exception:
@@ -604,19 +611,21 @@ def pnl_payload() -> dict:
                       "unrealized": 0.0,
                       "net": round(realized, 6)}})
     if has_live_mark:
+        realized_live = realized + fleet_open_realized
         points.append({
             "at": utcnow(), "bot_code": "fleet", "live": True,
-            "fleet": {"realized": round(realized, 6),
+            "fleet": {"realized": round(realized_live, 6),
                       "unrealized": round(fleet_unrealized, 6),
-                      "net": round(realized + fleet_unrealized, 6)}})
+                      "net": round(realized_live + fleet_unrealized, 6)}})
     return {"points": list(reversed(points)),
             "source": "freqtrade-dryrun",
             "total": len(points),
             "note": "fleet-cumulative realized accrues per closed dry-run "
-                    "trade (any instance); the trailing live point carries "
-                    "the fleet's open-position mark (engine REST). Written "
-                    "by nothing else — there is no WT-era snapshot in "
-                    "this feed."}
+                    "trade (any instance) plus the partial-exit realized "
+                    "still held inside open grid trades; the trailing live "
+                    "point carries both plus the fleet's open-position "
+                    "mark (engine REST). Written by nothing else — there "
+                    "is no WT-era snapshot in this feed."}
 
 
 # ── market OHLCV proxy (tvcli /fetch) for slot sparklines ──────────────
@@ -2170,9 +2179,20 @@ def _engine_instance_stats(entry: dict) -> dict:
                 cur.execute("SELECT count(*), coalesce(sum(close_profit_abs), 0) "
                             "FROM trades WHERE is_open=0 "
                             "AND close_date IS NOT NULL")
-                closed, realized = cur.fetchone()
+                closed, realized_closed = cur.fetchone()
                 out["closed_trades"] = int(closed or 0)
-                out["realized"] = round(float(realized or 0.0), 6)
+                # realized on OPEN trades lives in realized_profit
+                # (freqtrade accumulates the partial-exit profit there;
+                # close_profit_abs on an open trade is only the LAST
+                # exit's chunk); closed trades carry their final figure
+                # in close_profit_abs. Summing closed trades only hid
+                # every realized partial exit while a grid trade stays
+                # open — which for this fleet is nearly always.
+                cur.execute("SELECT coalesce(sum(realized_profit), 0) "
+                            "FROM trades WHERE is_open=1")
+                (realized_open,) = cur.fetchone()
+                out["realized"] = round(float(realized_closed or 0.0)
+                                        + float(realized_open or 0.0), 6)
                 cur.execute("SELECT count(*), max(order_filled_date) FROM orders "
                             "WHERE order_filled_date IS NOT NULL")
                 fills, last_fill = cur.fetchone()
@@ -3243,6 +3263,45 @@ def dev_action(action: str, body: dict) -> tuple[int, dict]:
 SERVER = None
 
 
+def _ledger_sync_loop():
+    """Own the M4 reliability-ledger cadence in-process.
+
+    The com.tvcli.grid-ledger-sync LaunchAgent (6h StartInterval) is the
+    original seam, but on this external-volume setup launchd spawns it
+    straight into exit 78 / EX_CONFIG with no output (the agent context
+    cannot open the declared stdio paths on /Volumes), which left
+    state/reliability.json stale for the whole trading day while the
+    manual code path runs clean. This loop runs the SAME code path
+    (`grid/dev ledger-sync`, idempotent, atomic reliability.json write)
+    from the console's own process context every 30 minutes. The
+    LaunchAgent stays installed as a harmless belt-and-braces; both
+    paths recompute from the engine DBs so interleaved runs converge."""
+    time.sleep(60)
+    while True:
+        log = os.path.join(STATE_DIR, "logs", "ledger-sync.log")
+        try:
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            r = subprocess.run(
+                [sys.executable, os.path.join(GRID_HOME, "dev"),
+                 "ledger-sync"],
+                cwd=GRID_HOME, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, timeout=180, text=True)
+            with open(log, "a") as fh:
+                stamp = datetime.now().astimezone().isoformat(
+                    timespec="seconds")
+                fh.write(f"[{stamp}] ledger-sync exit={r.returncode}\n")
+                fh.write(r.stdout or "")
+        except Exception as exc:  # noqa: BLE001
+            try:
+                with open(log, "a") as fh:
+                    fh.write(f"[{datetime.now().astimezone().isoformat(
+                        timespec='seconds')}] ledger-sync loop error: "
+                        f"{exc}\n")
+            except OSError:
+                pass
+        time.sleep(1800)
+
+
 def main():
     global SERVER
     # Graceful SIGTERM: exit 0 so a supervisor (launchd KeepAlive with
@@ -3255,6 +3314,9 @@ def main():
     srv = ThreadingHTTPServer((_bind_host, CONSOLE_PORT), Handler)
     SERVER = srv
     srv.started = utcnow()
+    import threading
+    threading.Thread(target=_ledger_sync_loop, daemon=True,
+                     name="ledger-sync").start()
     print(f"grid-autonomy console on http://{_bind_host}:{CONSOLE_PORT} "
           f"(ctl :{_ctl_port()}, state {STATE_DIR})", flush=True)
     try:
