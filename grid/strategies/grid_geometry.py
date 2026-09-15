@@ -23,12 +23,16 @@ record tests/fixtures/grid_resource.json):
               (percent vs percent) and guard < 500: append e,
               e *= (1 + step_pct/100); then append high as last line.
 
-  fee floor   fee_floor_pct = 2*spread_pct + ROUND_TRIP_FEE_PCT[venue]
+  fee floor   fee_floor_pct = 2*spread_pct + round_trip_fee_pct(venue,
+                             taker=taker)
               step_pct = min(step_max, max(step_min, step*step_mult,
                                            fee_floor_pct))
               NOTE: unlike a naive "min" reading, the fee floor RAISES
               the step (a step below the round-trip cost loses money
               on every fill); it is never lowered to it.
+              `taker=True` prices the floor at the taker round-trip fee
+              (matching a config that charges fee-per-side taker); it
+              defaults to False (maker) for back-compat.
 
   sizing      per_line  = max(alloc_usd / grids_n, min_cost)
               side_lines = max(1, (grids_n + 1) // 2)
@@ -46,11 +50,23 @@ except ImportError:  # package-relative import when execution is a package
 # venue is absent from ROUND_TRIP_FEE_PCT
 DEFAULT_ROUND_TRIP_FEE_PCT = 0.15
 
+# taker round-trip fee table — the fee a config that charges taker
+# per-side actually pays. hyperliquid 0.10%/side = 0.20% round trip;
+# binance 0.10%/side = 0.20% round trip. Used when `taker=True` so the
+# fee floor matches the *charged* cost (config `fee: 0.001` = 0.1%/side)
+# rather than the maker rebate the resting-limit order would earn.
+ROUND_TRIP_FEE_TAKER_PCT = {"hyperliquid": 0.20, "binance": 0.20}
+
+# taker default (2x the maker default 0.15)
+DEFAULT_ROUND_TRIP_FEE_TAKER_PCT = 0.30
+
 # iteration cap hard-coded in both grid_adapter geometry loops
 GUARD_CAP = 500
 
 __all__ = [
-    "ROUND_TRIP_FEE_PCT", "DEFAULT_ROUND_TRIP_FEE_PCT", "GUARD_CAP",
+    "ROUND_TRIP_FEE_PCT", "DEFAULT_ROUND_TRIP_FEE_PCT",
+    "ROUND_TRIP_FEE_TAKER_PCT", "DEFAULT_ROUND_TRIP_FEE_TAKER_PCT",
+    "GUARD_CAP",
     "channel", "geometric_lines", "closest_levels",
     "fee_floor_step", "round_trip_fee_pct",
     "per_line_size", "side_lines_count", "worst_case_commitment",
@@ -112,17 +128,22 @@ def closest_levels(lines, price):
     return closest_low, closest_high
 
 
-def round_trip_fee_pct(venue):
-    """Round-trip fee for a venue, in PERCENT (hyperliquid 0.10, binance
-    0.20, anything else defaults to 0.15 — grid_adapter's `.get` default)."""
-    return ROUND_TRIP_FEE_PCT.get(venue, DEFAULT_ROUND_TRIP_FEE_PCT)
+def round_trip_fee_pct(venue, taker=False):
+    """Round-trip fee for a venue, in PERCENT (maker: hyperliquid 0.10,
+    binance 0.20, anything else defaults to 0.15; taker: hyperliquid 0.20,
+    binance 0.20, anything else defaults to 0.30 — grid_adapter's `.get`
+    default, doubled for taker)."""
+    table = ROUND_TRIP_FEE_TAKER_PCT if taker else ROUND_TRIP_FEE_PCT
+    default = DEFAULT_ROUND_TRIP_FEE_TAKER_PCT if taker \
+        else DEFAULT_ROUND_TRIP_FEE_PCT
+    return table.get(venue, default)
 
 
 def fee_floor_step(step_pct, spread_pct, venue,
-                   step_min=0.1, step_max=2.0, step_mult=1.0):
+                   step_min=0.1, step_max=2.0, step_mult=1.0, taker=False):
     """Fee-aware step floor — exact build_ticket_payloads formula (percent):
 
-      rt_fee     = ROUND_TRIP_FEE_PCT.get(venue, 0.15)
+      rt_fee     = round_trip_fee_pct(venue, taker=taker)
       fee_floor  = 2 * (spread_pct if spread_pct is not None else 0.0)
                    + rt_fee
       step       = min(step_max, max(step_min, step_pct * step_mult,
@@ -130,11 +151,14 @@ def fee_floor_step(step_pct, spread_pct, venue,
 
     Units: spread_pct and the returned value are PERCENT; ROUND_TRIP_FEE_PCT
     values are also percent (0.10 = 0.10%), i.e. NOT divided by 100.
+    `taker=True` prices the floor at the taker round-trip fee (0.20% on
+    hyperliquid) so a config that charges taker per-side never models a
+    floor below its real cost; defaults to False (maker) for back-compat.
     Invariant (for sane step_min/step_max): the result is >= the fee floor
     whenever the floor is within [step_min, step_max]; the floor can only
     be clipped by an unusually small step_max.
     """
-    rt_fee = ROUND_TRIP_FEE_PCT.get(venue, DEFAULT_ROUND_TRIP_FEE_PCT)
+    rt_fee = round_trip_fee_pct(venue, taker=taker)
     fee_floor = 2 * (spread_pct if spread_pct is not None else 0.0) + rt_fee
     return min(step_max, max(step_min, step_pct * step_mult, fee_floor))
 

@@ -18,7 +18,13 @@
     },
     "buy": {
       "band_atr": 4.2,
-      "step_factor": 0.21
+      "step_factor": 1.0,
+      "min_atr_pct": 0.3,
+      "min_step_multiple": 1.5,
+      "trend_tolerance_pct": 0.5,
+      "alloc_usd": 100.0,
+      "min_cost": 10.0,
+      "spread_pct": 0.02
     }
   },
   "ft_stratparam_v": 1,
