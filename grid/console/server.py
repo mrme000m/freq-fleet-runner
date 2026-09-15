@@ -879,116 +879,126 @@ def position_sweeps_payload(limit=25):
 
 
 def reliability_archive_payload(limit_per_archetype=20) -> dict:
-    """Recent closed round-trips per archetype, sourced from
-    `state/reliability_archive.json` (rotated-out bots' last legs). Drives
-    the expandable row under each archetype on the Reliability tab — the
-    operator wants to see *which* trades produced the PF/win rate, not
-    just the aggregates.
-
-    Each row is a slim {ts, symbol, realized, hold_s, is_panic,
-    is_synthetic, strategy_id} dict; the daemon's archived shape is
-    richer (gross / fee / hold_s / strategy_id) but the UI only needs
-    the operator-facing columns. Synthetic rows are flagged so the UI can
-    mark them separately (the aggregates above already flag the
-    pollution in bulk via the `synthetic_samples` count)."""
-    # Direct read of the workspace archive. The WT-era reliability_grid
-    # module was never vendored (it pulls in the retired WT browser
-    # stack) — only its side-effect-free JSON read + synthetic flagging
-    # is needed here, inlined so no dangling import remains.
+    """Recent closed round-trips per archetype — derived LIVE from the
+    fleet's dry-run trades DBs (the M4 pairing trips: one row per
+    completed grid line round-trip). Falls back to the WT-era archive
+    file only while the fleet has produced no trips yet."""
+    live = _reliability_live()
     arch = {}
-    archive = _read_json(os.path.join(STATE_DIR, "reliability_archive.json"),
-                         None)
-    if isinstance(archive, dict):
-        arch = {a: [dict(t, synthetic=bool(t.get("synthetic"))
-                         or str(t.get("strategy_id") or "").startswith("backfill"))
-                    for t in rows if isinstance(t, dict)]
-                for a, rows in archive.items()}
-    out = {}
-    for name, rows in arch.items():
+    for name, trips in (live.get("trips") or {}).items():
         slim = []
-        for t in rows or []:
+        for t in (trips or []):
             if not isinstance(t, dict):
                 continue
+            hold_s = None
+            if isinstance(t.get("close_ts"), (int, float)) \
+                    and isinstance(t.get("entered_at"), (int, float)):
+                hold_s = t["close_ts"] - t["entered_at"]
             slim.append({
-                "ts": t.get("close_ts") or t.get("ts") or t.get("at_epoch"),
+                "ts": t.get("close_ts"),
                 "symbol": t.get("symbol") or "",
-                "venue": t.get("venue") or "",
-                "realized": (t.get("realized_usd") or t.get("pnl_usd")
-                             or t.get("pnl") or t.get("realized")),
-                "hold_s": t.get("hold_s"),
-                "is_panic": bool(t.get("is_panic") or t.get("panic")),
+                "venue": "hyperliquid",
+                "realized": t.get("pnl_usd"),
+                "hold_s": hold_s,
+                "is_panic": False,
                 "is_synthetic": bool(t.get("synthetic")),
-                "strategy_id": t.get("strategy_id") or t.get("bot_code"),
+                "strategy_id": t.get("strategy_id"),
+                "kind": t.get("kind"),
+                "gain_pct": t.get("gain_pct"),
             })
         slim.sort(key=lambda r: r.get("ts") or 0, reverse=True)
-        out[name] = slim[:max(1, min(limit_per_archetype, 100))]
-    return {"archetypes": out, "source": "reliability_archive.json",
-            "freshness": _freshness(
-                os.path.join(STATE_DIR, "reliability_archive.json"),
-                "reliability archive")}
+        arch[name] = slim[:max(1, min(limit_per_archetype, 100))]
+    source = "engine trades DBs (live)"
+    if not any(arch.values()):
+        # pre-reset fallback: the WT-era archive file on disk
+        source = "reliability_archive.json (WT-era)"
+        archive = _read_json(os.path.join(STATE_DIR,
+                                          "reliability_archive.json"),
+                             None)
+        if isinstance(archive, dict):
+            arch = {a: [dict(t, synthetic=bool(t.get("synthetic"))
+                             or str(t.get("strategy_id") or "")
+                             .startswith("backfill"))
+                        for t in rows if isinstance(t, dict)]
+                    for a, rows in archive.items()}
+            out = {}
+            for name, rows in arch.items():
+                slim = []
+                for t in rows or []:
+                    if not isinstance(t, dict):
+                        continue
+                    slim.append({
+                        "ts": t.get("close_ts") or t.get("ts") or t.get("at_epoch"),
+                        "symbol": t.get("symbol") or "",
+                        "venue": t.get("venue") or "",
+                        "realized": (t.get("realized_usd") or t.get("pnl_usd")
+                                     or t.get("pnl") or t.get("realized")),
+                        "hold_s": t.get("hold_s"),
+                        "is_panic": bool(t.get("is_panic") or t.get("panic")),
+                        "is_synthetic": bool(t.get("synthetic")),
+                        "strategy_id": t.get("strategy_id") or t.get("bot_code"),
+                    })
+                slim.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+                out[name] = slim[:max(1, min(limit_per_archetype, 100))]
+            arch = out
+    if not any(arch.values()):
+        # nothing closed yet and no WT-era file either — honest empty state
+        source = "none yet — live; fills as the fleet closes grid trips"
+    return {"archetypes": arch, "source": source}
 
 
 def reliability_payload() -> dict:
+    """Reliability ledger — LIVE-first. The primary table is computed from
+    the fleet's dry-run trades DBs (see _reliability_live): this is the
+    standalone system's own evidence and it fills as grid trips close.
+    The WT-era file snapshot (state/reliability.json) is served as a
+    labeled secondary block for as long as it exists on disk."""
     path = os.path.join(STATE_DIR, "reliability.json")
-    ledger = _read_json(path, {}) or {}
-    missing = not os.path.isfile(path)
-    age_h = None
-    try:
-        age_h = round((time.time() - os.path.getmtime(path)) / 3600.0, 1)
-    except OSError:
-        missing = True
-    archs = {}
-    for arch, st in ledger.items():
-        if isinstance(st, dict):
-            st = dict(st)
-            st["tier"] = _tier(st)
-            # real (lived) samples vs synthetic/seeded backfill — the
-            # aggregates still include both, so the UI flags pollution.
-            synth = st.get("synthetic_samples")
-            st["real_samples"] = (max(0, (st.get("samples") or 0)
-                                      - synth) if isinstance(synth, (int, float))
-                                  else st.get("samples"))
-            # ladder progression: which rung is the archetype on, and how
-            # many more samples before the NEXT rung. Consumed by the UI
-            # to render progress arrows + a kill-flag ladder status line.
-            samples = st.get("samples") or 0
-            probe = LADDER["probe_samples"]
-            full = LADDER["full_samples"]
-            if st["tier"] == "base":
-                st["ladder_next"] = "probe"
-                st["ladder_next_at"] = probe
-                st["ladder_progress_pct"] = round(min(100, (samples / probe) * 100), 1)
-            elif st["tier"] == "probe":
-                st["ladder_next"] = "full"
-                st["ladder_next_at"] = full
-                st["ladder_progress_pct"] = round(min(100, (samples / full) * 100), 1)
-            elif st["tier"] == "full":
-                st["ladder_next"] = None
-                st["ladder_next_at"] = None
-                st["ladder_progress_pct"] = 100.0
-            elif st["tier"] == "killed":
-                st["ladder_next"] = None
-                st["ladder_next_at"] = None
-                st["ladder_progress_pct"] = 0.0
-            archs[arch] = st
-    # the ledger is a snapshot refreshed by the daemon's health cycle;
-    # past the 24h refresh cadence (+grace) it is stale evidence.
-    stale = bool(age_h is not None and age_h > 26)
-    if missing:
-        note = ("no closed round-trips yet — archetypes populate once paper "
-                "bots close their first grid trip (first refresh after a "
-                "fresh deploy)")
-    elif not archs:
-        note = ("ledger computed but empty — no closed grid round-trips yet; "
-                "archetypes appear after the first completed trip")
-    elif stale:
-        note = (f"ledger snapshot is {age_h}h old (stale past the 24h "
-                f"refresh cadence)")
-    else:
-        note = ""
-    # kill-flag ladder thresholds (mirrors reliability_grid.py constants —
-    # the daemon binds them on its own, the console just surfaces them so
-    # an operator can see WHY a particular archetype was refused).
+    file_ledger = _read_json(path, {}) or {}
+    live = _reliability_live()
+
+    def _enrich(ledger: dict) -> dict:
+        archs = {}
+        for arch, st in ledger.items():
+            if isinstance(st, dict):
+                st = dict(st)
+                st["tier"] = _tier(st)
+                synth = st.get("synthetic_samples")
+                st["real_samples"] = (max(0, (st.get("samples") or 0)
+                                          - synth)
+                                      if isinstance(synth, (int, float))
+                                      else st.get("samples"))
+                samples = st.get("samples") or 0
+                probe = LADDER["probe_samples"]
+                full = LADDER["full_samples"]
+                if st["tier"] == "base":
+                    st["ladder_next"] = "probe"
+                    st["ladder_next_at"] = probe
+                    st["ladder_progress_pct"] = round(
+                        min(100, (samples / probe) * 100), 1)
+                elif st["tier"] == "probe":
+                    st["ladder_next"] = "full"
+                    st["ladder_next_at"] = full
+                    st["ladder_progress_pct"] = round(
+                        min(100, (samples / full) * 100), 1)
+                elif st["tier"] == "full":
+                    st["ladder_next"] = None
+                    st["ladder_next_at"] = None
+                    st["ladder_progress_pct"] = 100.0
+                else:                    # killed
+                    st["ladder_next"] = None
+                    st["ladder_next_at"] = None
+                    st["ladder_progress_pct"] = 0.0
+                archs[arch] = st
+        return archs
+
+    archs = _enrich(live.get("ledger") or {})
+    note = ("computed live from the fleet's dry-run trades DBs — samples "
+            "are closed grid round-trips" if archs else
+            "no closed round-trips yet — the ledger fills as the dry-run "
+            "fleet completes its first grid trips")
+    if live.get("error"):
+        note = live["error"]
     return {
         "ladder": LADDER,
         "kill_thresholds": {
@@ -997,11 +1007,15 @@ def reliability_payload() -> dict:
             "live_min_samples": 30,
         },
         "archetypes": archs,
-        "ledger_age_h": age_h, "stale": stale, "missing": missing,
-        "note": note, "refresh_cadence_h": 24,
-        "freshness": _freshness(
-            os.path.join(STATE_DIR, "reliability.json"),
-            "reliability ledger"),
+        "note": note,
+        "source": "engine trades DBs (live)",
+        "engine_freshness": live.get("freshness"),
+        "freshness": live.get("freshness") or _freshness(
+            path, "WT-era ledger file"),
+        # WT-era snapshot, kept visible (labeled) while it exists on disk
+        "file_ledger": _enrich(file_ledger),
+        "file_freshness": (_freshness(path, "WT-era ledger file")
+                           if file_ledger else None),
     }
 
 
@@ -2217,6 +2231,69 @@ def _engine_session_payload() -> dict:
     return {"at": utcnow(), "instances": instances}
 
 
+# ── live reliability ledger (M4 toolchain over the fleet's trades DBs) ──
+
+# every fleet instance runs GridStrategy longs — one archetype bucket
+FT_ARCHETYPE = "Long Grid / classic LONG"
+
+_REL_CACHE: tuple | None = None
+
+
+def _reliability_live() -> dict:
+    """Live ledger + closed round-trips computed from the fleet's dry-run
+    trades DBs via the M4 toolchain (grid.reliability.pairing.from_sqlite
+    → grid.reliability.ledger.compute). 60s TTL — /api/overview polls
+    every 5s and the pairing pass is not free. Returns
+    {"ledger", "trips", "freshness", "error"}; every field degrades
+    safely so the Reliability tab renders an honest empty state rather
+    than a 500."""
+    global _REL_CACHE
+    if _REL_CACHE and _REL_CACHE[0] > time.time():
+        return _REL_CACHE[1]
+    out = {"ledger": {}, "trips": {}, "freshness": None, "error": None}
+    try:
+        sys.path.insert(0, os.path.dirname(GRID_HOME))   # repo root → grid pkg
+        from grid.reliability.pairing import from_sqlite
+        from grid.reliability import ledger as m4ledger
+    except Exception as exc:
+        out["error"] = f"M4 import failed: {str(exc)[:120]}"
+    else:
+        sources = []
+        newest = 0.0
+        for code, entry in (_ft_registry().get("instances") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            db = os.path.join(entry.get("dir") or "",
+                              "tradesv3.dryrun.sqlite")
+            if not os.path.isfile(db):
+                continue
+            try:
+                newest = max(newest, os.stat(db).st_mtime)
+            except OSError:
+                pass
+            try:
+                trips, _report = from_sqlite(db, source_id=code)
+            except Exception:
+                continue
+            if trips:
+                sources.append({"archetype": FT_ARCHETYPE, "trips": trips})
+        out["ledger"] = m4ledger.compute(sources)
+        out["trips"] = {s["archetype"]: s["trips"] for s in sources}
+        if newest:
+            out["freshness"] = {
+                "at": newest,
+                "at_iso": datetime.fromtimestamp(
+                    newest, tz=timezone.utc).isoformat(),
+                "age_s": int(time.time() - newest),
+                "kind": "engine trades DBs",
+                "path": "grid/state/ft_fleet/*/tradesv3.dryrun.sqlite",
+                "note": "live — recomputed from the dry-run trades DBs "
+                        "as grid trips close (60s cache)",
+            }
+    _REL_CACHE = (time.time() + 60.0, out)
+    return out
+
+
 def overview_payload() -> dict:
     st = _load_state()
     ok_status, ctl_status = _ctl_cached("/status")
@@ -2406,8 +2483,11 @@ def _optimizer_standalone_payload() -> dict:
     tuned = _read_json(os.path.join(os.path.dirname(STATE_DIR), "strategies",
                                     "GridStrategy.json"), {}) or {}
 
-    # Reliability summary — already curated by the M4 ledger.
-    rel = _read_json(os.path.join(STATE_DIR, "reliability.json"), {}) or {}
+    # Reliability summary — live from the fleet's trades DBs (M4 math),
+    # falling back to the WT-era file ledger only while it still exists
+    rel = (_reliability_live().get("ledger")
+           or _read_json(os.path.join(STATE_DIR, "reliability.json"), {})
+           or {})
 
     # Decision journal tail (state/decisions.jsonl) — last 5 entries.
     decisions = []

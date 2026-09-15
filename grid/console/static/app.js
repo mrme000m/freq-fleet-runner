@@ -1165,44 +1165,15 @@ function renderEngineSession(eng) {
 
 /* ── position optimizer (advisory recommendations + apply gate) ─────── */
 
-let optimizerData = null;
-
 async function loadOptimizer() {
-  // /api/optimizer carries the workspace truth (applicable:false in this
-  // workspace). Drive the panel from it; fall back to /api/recommendations
-  // ONLY for legacy WT-era daemon compatibility.
+  // /api/optimizer carries the workspace truth (applicable:false — the
+  // WT-era slow-loop optimizer has no freqtrade counterpart; GridStrategy
+  // revalues the channel in-strategy every candle). The panel shows the
+  // deployed geometry, the tuned params and the live reliability ledger.
   let f = null;
   try { f = await api("/api/optimizer"); }
-  catch (e) { f = null; }
-  if (f && f.applicable === false) {
-    optimizerData = null;
-    renderOptimizer(f);
-    // the ctl-plane companions (/status, /optimizer/swap-log,
-    // /position-sweeps) don't apply either — render them empty and stop.
-    renderFastOptimizer(null, null);
-    renderPositionAnalysis(null, null);
-    renderDataSources(null);
-    renderSwapLog(null);
-    return;
-  }
-  let d;
-  try { d = await api("/api/recommendations?limit=200"); }
-  catch (e) { toast(`optimizer: ${e.message}`, true); d = null; }
-  if (d) { optimizerData = d; renderOptimizer(d); }
-  let st = null;
-  try { st = await api("/api/status"); }
-  catch (e) { st = null; }
-  if (!st || st.error) st = null;
-  let sweeps = null;
-  try { sweeps = await api("/api/position-sweeps"); }
-  catch (e) { sweeps = null; }
-  let swapLog = null;
-  try { swapLog = await api("/api/optimizer/swap-log"); }
-  catch (e) { swapLog = null; }
-  renderFastOptimizer(f, st);
-  renderPositionAnalysis(st, sweeps);
-  renderDataSources(st);
-  renderSwapLog(swapLog);
+  catch (e) { toast(`optimizer: ${e.message}`, true); return; }
+  renderOptimizer(f || {});
 }
 
 /* Standalone-workspace Optimizer panel: geom + tuned params + reliability
@@ -1346,420 +1317,11 @@ function blockedByBadge(b) {
 }
 
 function renderOptimizer(d) {
-  // Standalone workspace path — the WT-era slow-loop optimizer doesn't
-  // apply (it ran against WunderTrading's grid_bots; GridStrategy handles
-  // per-candle grid adjustments in-strategy). Render the truthful geom +
-  // tuned params + reliability ledger panel instead of error toasts.
-  if (d && d.applicable === false) { renderStandaloneOptimizer(d); return; }
-
-  const recs = (d && d.recommendations) || [];
-  const applyEnabled = !!(d && d.apply);
-  const maxDay = (d && d.max_apply_per_day) ?? "?";
-  const persistedToday = (d && d.persisted_today) ?? "?";
-
-  const bn = $("#opt-banner");
-  if (bn) {
-    if (applyEnabled) {
-      bn.innerHTML = `<div class="banner banner--info"><div>
-        <div class="banner-title">Autonomous apply enabled</div>
-        position_optimizer.apply is true — the daemon may edit freqtrade grids directly. ${persistedToday}/${maxDay} recommendations persisted today.</div></div>`;
-    } else {
-      bn.innerHTML = `<div class="banner banner--warn"><div>
-        <div class="banner-title">Advisory mode — recommendations are NOT applied</div>
-        position_optimizer.apply is false in config.yaml. Every recommendation below is journaled/persisted only; nothing auto-edits freqtrade. ${persistedToday}/${maxDay} persisted today (cap: max_apply_per_day).</div></div>`;
-    }
-  }
-
-  const pending = recs.filter((r) => !r.applied);
-  const applied = recs.filter((r) => !!r.applied);
-  $("#opt-pending-count").textContent = `${pending.length} pending \u00b7 ${applied.length} applied`;
-  $("#opt-applied-count").textContent = `${applied.length} applied`;
-
-  const row = (r, appliedMode) => {
-    const delta = r.expected_delta_pct;
-    const at = appliedMode ? (r.applied_at || r.at) : r.at;
-    return `<tr>
-      <td class="td-mono" title="${esc(r.at || "")}">${esc(String(at || "").replace("T", " ").slice(5, 16))}</td>
-      <td class="td-mono">${esc(r.slot ?? "\u2014")}</td>
-      <td class="td-mono">${esc(r.venue || "")}:${esc(r.symbol || "?")}</td>
-      <td><span class="badge badge--violet">${esc(r.recommendation || "?")}</span></td>
-      <td class="td-mono ${(delta || 0) >= 0 ? "m-value--good" : "m-value--bad"}" title="expected 24h profit improvement">${delta == null ? "\u2014" : `${delta >= 0 ? "+" : ""}${fmtNum(delta, 2)}%`}</td>
-      <td class="td-mono">${r.confidence == null ? "\u2014" : fmtNum(r.confidence, 2)}</td>
-      <td class="td-mono">${esc(r.trigger || "\u2014")}</td>
-      ${appliedMode ? "" : `<td>${blockedByBadge(r.blocked_by)}</td>`}
-      <td><div class="rationale" title="${esc(r.rationale || "")}">${esc(r.rationale || "\u2014")}</div></td>
-    </tr>`;
-  };
-
-  // Pending: group by slot (then venue+symbol) so a slot that has been
-  // re-evaluated several times in a row shows ONE row with the latest rec
-  // + an expandable history. Most slots have 0–1 pending; the ones that
-  // have been oscillating across the apply gate are the interesting case.
-  const bySlot = new Map();
-  for (const r of pending) {
-    const key = `${r.slot ?? "—"}|${r.venue}|${r.symbol}`;
-    if (!bySlot.has(key)) bySlot.set(key, []);
-    bySlot.get(key).push(r);
-  }
-  const groupRows = [];
-  for (const [key, recs] of bySlot) {
-    recs.sort((a, b) => (b.at || "").localeCompare(a.at || ""));
-    const [head, ...rest] = recs;
-    const gKey = `g-${key.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
-    const latestDelta = isNum(head.expected_delta_pct) ? Number(head.expected_delta_pct) : null;
-    const deltaCls = latestDelta == null ? "m-value--dim"
-      : latestDelta > 0 ? "m-value--good" : "m-value--bad";
-    const latestConf = isNum(head.confidence) ? fmtNum(head.confidence, 2) : "—";
-    const blocked = blockedByBadge(head.blocked_by);
-    const at = esc(String(head.at || "").replace("T", " ").slice(5, 16));
-    const slot = esc(head.slot ?? "—");
-    const market = `<span class="venue-tag venue-tag--${esc(head.venue)}">${esc(head.venue || "")}</span>:${esc(head.symbol || "?")}`;
-    const rec = `<span class="badge badge--violet">${esc(head.recommendation || "?")}</span>`;
-    const delta = `<span class="${deltaCls}">${latestDelta == null ? "—" : `${latestDelta >= 0 ? "+" : ""}${fmtNum(latestDelta, 2)}%`}</span>`;
-    const hasMore = rest.length > 0;
-    const chev = hasMore
-      ? `<span class="rel-chevron" aria-hidden="true">▸</span>`
-      : `<span class="rel-chevron" style="visibility:hidden">▸</span>`;
-    const trigger = esc(head.trigger || "—");
-    const blockedCell = blocked;
-    const rationale = `<div class="rationale" title="${esc(head.rationale || "")}">${esc(head.rationale || "—")}</div>`;
-    groupRows.push(`<tr class="rec-group" data-gkey="${gKey}" data-count="${recs.length}">
-      <td class="td-mono" title="${esc(head.at || "")}">${at}</td>
-      <td class="td-mono">${slot}</td>
-      <td class="td-mono">${market}</td>
-      <td>${rec}</td>
-      <td class="td-mono">${delta}</td>
-      <td class="td-mono">${latestConf}</td>
-      <td class="td-mono">${trigger}</td>
-      <td>${blockedCell}</td>
-      <td>${chev} ${hasMore ? `<span class="mono" style="color:var(--ink-faint);font-size:10.5px">+${rest.length} earlier</span>` : ""} ${rationale}</td>
-    </tr>`);
-    if (hasMore) {
-      const hist = rest.map((r) => row(r, false)).join("");
-      groupRows.push(`<tr class="rec-detail" data-gkey="${gKey}" hidden><td colspan="9">
-        <div class="empty-note" style="margin:0 0 6px;font-size:11px">earlier recs for this slot (oldest first)</div>
-        <table class="ledger rec-detail-table">${hist}</table>
-      </td></tr>`);
-    }
-  }
-  $("#opt-pending-body").innerHTML = groupRows.join("") ||
-    `<tr><td colspan="9"><div class="empty-note">No pending recommendations \u2014 the position optimizer emits one when a bot\u2019s grid is off-price by more than the drift threshold (15 min cadence).</div></td></tr>`;
-  // expand/collapse for grouped recs
-  for (const head of document.querySelectorAll("#opt-pending-body tr.rec-group")) {
-    head.addEventListener("click", (e) => {
-      // ignore the inner rationale text selection
-      if (window.getSelection && window.getSelection().toString()) return;
-      const det = document.querySelector(`#opt-pending-body tr.rec-detail[data-gkey="${head.dataset.gkey}"]`);
-      if (!det) return;
-      const show = det.hidden;
-      det.hidden = !show;
-      const chev = head.querySelector(".rel-chevron");
-      if (chev) chev.textContent = show ? "▾" : "▸";
-    });
-  }
-  $("#opt-applied-body").innerHTML = applied.map((r) => row(r, true)).join("") ||
-    `<tr><td colspan="8"><div class="empty-note">Nothing applied yet${applyEnabled ? "" : " \u2014 apply is disabled in config (advisory mode)"}.</div></td></tr>`;
-}
-
-/* ── fast slot optimizer (2–5m cadence capital reallocation) ───────── */
-
-function renderFastOptimizer(f, st) {
-  const box = $("#opt-fast");
-  if (!box) return;
-  const o = f && f.optimizer;
-  if (!o) {
-    // ctl plane down or the fetch itself failed — quiet fail-soft note
-    const why = (f && (f.error || f.detail)) || "unreachable";
-    box.innerHTML = `
-      <div class="card-head"><span class="card-title">Fast slot optimizer</span>
-        <span class="spacer"></span><span class="badge badge--warn" title="daemon ctl plane not responding">offline</span></div>
-      <div class="card-body"><div class="empty-note">Fast-optimizer status unavailable (${esc(why)}) — fail-soft: this panel refills automatically once the daemon ctl plane is reachable again. Swaps paused while it is down.</div></div>`;
-    return;
-  }
-  const rep = o.last_report || {};
-  const hunt = rep.hunt || {};
-  const idle = rep.idle || [];
-  const vetoes = rep.vetoes || [];
-  const cap = rep.capital || {};
-  const cacheAge = f.screen_cache_age_s == null ? null : `${fmtNum(f.screen_cache_age_s, 0)}s`;
-  const kv = (k, v, title = "") =>
-    `<div class="row"><span class="k"${title ? ` title="${esc(title)}"` : ""}>${esc(k)}</span><span class="v">${v}</span></div>`;
-
-  box.innerHTML = `
-    <div class="card-head"><span class="card-title">Fast slot optimizer</span>
-      <span class="spacer"></span><span class="mono" style="font-size:10.5px;color:var(--ink-faint)" title="last report ${esc(rep.at || "—")}">report ${esc(relTime(rep.at))}${cacheAge ? ` · screen cache ${esc(cacheAge)}` : ""}</span></div>
-    <div class="card-body"><div class="mini-kv">
-      ${kv("State", `${o.enabled ? '<span class="badge badge--ok">enabled</span>' : '<span class="badge badge--dim">disabled</span>'} · every ${esc(o.interval_min ?? "—")} min`, "fast capital-reallocation loop (optimizer.py)")}
-      ${kv("Cycles", `${esc(o.cycles ?? "—")} · swaps ${esc(o.swaps_total ?? 0)}`, "completed cycles; total slot swaps executed through the guard/churn machinery")}
-      ${kv("Last cycle", esc(relTime(o.last_at)))}
-      ${kv("Capital", `${fmtUsd(cap.committed_usd)} committed / ${fmtUsd(cap.deployable_ceiling_usd)} ceiling · ${fmtUsd(cap.idle_committed_usd)} idle · ${esc(cap.free_slots ?? "—")} free slot(s)`, "deployable ceiling = free capital available to commit to challengers")}
-      ${kv("Projected /24h", (st && st.pnl && isNum(st.pnl.projected_24h_usd)) ? fmtUsd(Number(st.pnl.projected_24h_usd)) : "—", "model-based expected grid income per 24h, net of round-trip fees (from the fleet PnL snapshot)")}
-      ${kv("Projected return /yr", (st && st.pnl && isNum(st.pnl.projected_annual_return_pct)) ? `${fmtNum(Number(st.pnl.projected_annual_return_pct), 1)}%` : "—", "approximate annualized return on committed capital")}
-      ${kv("Projected doubling time", (st && st.pnl && isNum(st.pnl.projected_double_days)) ? fmtDouble(Number(st.pnl.projected_double_days)) : "—", "approximate time for committed capital to double if the projected rate held")}
-    </div></div>
-    <div class="card-body--tight table-wrap">
-      <table class="ledger">
-        <thead><tr><th>idle slot</th><th>market</th><th>reasons</th></tr></thead>
-        <tbody>
-          ${idle.map((s) => `<tr>
-            <td class="td-mono">${esc(s.slot ?? "—")}</td>
-            <td class="td-mono">${esc(s.venue || "")}:${esc(s.symbol || "?")}</td>
-            <td>${(s.reasons || []).map((r) => `<span class="badge badge--warn">${esc(r)}</span>`).join(" ") || "—"}</td>
-          </tr>`).join("") || `<tr><td colspan="3"><div class="empty-note">No idle slots in the last report — every slot is pulling its weight.</div></td></tr>`}
-        </tbody>
-      </table>
-    </div>
-    <div class="card-body--tight table-wrap">
-      <table class="ledger">
-        <thead><tr><th>challenger</th><th>regime</th><th>score</th><th>harvest 24h</th></tr></thead>
-        <tbody>
-          ${(hunt.top3 || []).map((c) => `<tr>
-            <td class="td-mono"><span class="venue-tag venue-tag--${esc(c.venue)}">${esc(c.venue)}</span>:${esc(c.symbol)}</td>
-            <td><span class="badge badge--dim">${esc(c.regime || "?")}</span></td>
-            <td class="td-mono">${esc(fmtNum(c.score_final, 1))}</td>
-            <td class="td-mono ${(c.harvest_net_pct_24h || 0) >= 0 ? "m-value--good" : "m-value--bad"}">${c.harvest_net_pct_24h == null ? "—" : `${Number(c.harvest_net_pct_24h) >= 0 ? "+" : ""}${fmtNum(c.harvest_net_pct_24h, 2)}%`}</td>
-          </tr>`).join("") || `<tr><td colspan="4"><div class="empty-note">No challenger hunt yet — the first cycle populates the top-3.</div></td></tr>`}
-        </tbody>
-      </table>
-    </div>
-    <div class="card-body--tight table-wrap">
-      <table class="ledger">
-        <thead><tr><th>vetoed slot</th><th>reason</th></tr></thead>
-        <tbody>
-          ${vetoes.map((v) => `<tr>
-            <td class="td-mono">${esc(v.slot ?? "—")}</td>
-            <td><div class="rationale" title="${esc(v.reason || "")}">${esc(v.reason || "—")}</div></td>
-          </tr>`).join("") || `<tr><td colspan="2"><div class="empty-note">No recent vetoes — nothing blocked by the guard/churn bounds.</div></td></tr>`}
-        </tbody>
-      </table>
-    </div>
-    ${arbiterVerdictHTML(rep.arbiter)}`;
-}
-
-/* Last arbiter verdict (Mistral by default) — when the fast loop DID
-   consult the model and what it said. Hidden when the loop has not
-   needed an arbiter call yet (the band pre-filter skips the call when
-   no swap is numerically possible — a healthy steady-state). */
-function arbiterVerdictHTML(arb) {
-  if (!arb || typeof arb !== "object") return "";
-  const slot = arb.slot;
-  const approve = arb.approve === true;
-  const conf = isNum(arb.confidence) ? fmtNum(arb.confidence, 2) : "—";
-  const pick = arb.challenger || "—";
-  const reason = arb.reason || "";
-  const degraded = arb.llm_degraded === true;
-  const llm = arb.llm || (arb.provider || "mistral");
-  const verdictBadge = approve
-    ? `<span class="badge badge--ok">approve</span>`
-    : `<span class="badge badge--bad">reject</span>`;
-  return `<div class="card-body--tight table-wrap" style="border-top:1px solid var(--rule)">
-    <div class="card-head" style="padding:6px 0 4px"><span class="card-title" style="font-size:12.5px">Last arbiter verdict</span>
-      <span class="spacer"></span>
-      ${degraded ? '<span class="badge badge--warn" title="LLM chain unavailable — rule fallback was used instead of the model">degraded</span>' : `<span class="mono" style="font-size:10.5px;color:var(--ink-faint)">${esc(llm)}</span>`}
-    </div>
-    <div class="mini-kv" style="padding:4px 0">
-      <div class="row"><span class="k">verdict</span><span class="v">${verdictBadge} · slot ${esc(slot ?? "—")} → ${esc(pick)} · conf ${conf}</span></div>
-      ${reason ? `<div class="row"><span class="k">reason</span><span class="v" title="${esc(reason)}">${esc(reason.slice(0, 200))}${reason.length > 200 ? "…" : ""}</span></div>` : ""}
-    </div>
-  </div>`;
-}
-
-/* ── position optimizer: latest per-bot analysis + sweep log ──────── */
-
-/* The Pending/Applied tables below only carry recs gated at Δ≥2% — by
-   design, so they sit empty most of the time. This card shows what the
-   engine LAST concluded per bot (state.active_bots[*].position_optimizer,
-   via ctl /status), including keeps and sub-threshold deltas, plus the
-   journal sweep log underneath. */
-function renderPositionAnalysis(st, sweeps) {
-  const box = $("#opt-latest-analysis");
-  if (!box) return;
-  const ab = (st && typeof st.active_bots === "object" && st.active_bots) || {};
-  const rows = Object.entries(ab).map(([slot, bot]) => {
-    const po = (bot && typeof bot.position_optimizer === "object"
-      && bot.position_optimizer) || {};
-    return {
-      slot, symbol: (bot || {}).symbol, venue: (bot || {}).venue,
-      rec: po.last_recommendation ?? null,
-      delta: isNum(po.last_delta_pct) ? Number(po.last_delta_pct) : null,
-      conf: isNum(po.last_confidence) ? Number(po.last_confidence) : null,
-      trigger: po.last_trigger ?? null,
-      at: po.last_analyzed_at ?? null,
-      hop: po.last_fetch_hop ?? null,
-    };
-  }).filter((r) => r.at != null || r.rec != null)
-    .sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0));
-
-  const sweepList = (sweeps && Array.isArray(sweeps.sweeps)
-    ? sweeps.sweeps : []).slice(0, 10);
-  const recBadge = (rec) => rec === "keep"
-    ? `<span class="badge badge--dim">keep</span>`
-    : `<span class="badge badge--violet">${esc(rec || "?")}</span>`;
-
-  box.innerHTML = `
-    <div class="card-head"><span class="card-title">Latest position analysis</span>
-      <span class="spacer"></span><span class="mono" style="font-size:11px;color:var(--ink-faint)" title="per-bot last analysis from state.active_bots[*].position_optimizer (all recs, including keeps and sub-threshold Δ — the Pending/Applied tables below only carry Δ≥2% gated recs)">${rows.length} bot${rows.length === 1 ? "" : "s"} analyzed</span></div>
-    <div class="card-body--tight table-wrap">
-      <table class="ledger">
-        <thead><tr>
-          <th>slot</th><th>market</th><th>rec</th><th>Δ%</th>
-          <th>conf</th><th>trigger</th><th>analyzed</th><th>candle hop</th>
-        </tr></thead>
-        <tbody>
-          ${rows.map((r) => `<tr>
-            <td class="td-mono">${esc(r.slot)}</td>
-            <td class="td-mono"><span class="venue-tag venue-tag--${esc(r.venue || "")}">${esc(r.venue || "")}</span>:${esc(r.symbol || "?")}</td>
-            <td>${recBadge(r.rec)}</td>
-            <td class="td-mono ${(r.delta || 0) >= 0 ? "m-value--good" : "m-value--bad"}">${r.delta == null ? "\u2014" : `${r.delta >= 0 ? "+" : ""}${fmtNum(r.delta, 2)}`}</td>
-            <td class="td-mono">${r.conf == null ? "\u2014" : fmtNum(r.conf, 2)}</td>
-            <td class="td-mono">${esc(r.trigger || "\u2014")}</td>
-            <td class="td-mono" title="${esc(r.at != null ? String(r.at) : "")}">${esc(relTimeEpoch(r.at))}</td>
-            <td>${r.hop == null ? "\u2014" : `<span class="badge badge--dim" title="how the analysis candles were fetched">${esc(r.hop)}</span>`}</td>
-          </tr>`).join("") || `<tr><td colspan="8"><div class="empty-note">No bot has been analyzed yet \u2014 the position optimizer runs on its 15 min cadence (plus an on-entry pass after every deploy).</div></td></tr>`}
-        </tbody>
-      </table>
-    </div>
-    <details style="padding:10px 14px;border-top:1px solid var(--rule)">
-      <summary class="mono" style="font-size:11px;color:var(--ink-faint);cursor:pointer">sweep history \u00b7 last ${sweepList.length} (journal)</summary>
-      <ul class="feed" style="max-height:220px;overflow:auto">
-        ${sweepList.map((e) => `<li><span class="f-at">${esc(String(e.at || "").replace("T", " ").slice(5, 16))}</span><span class="f-kind k--${esc(String(e.kind || "?").replace(/_/g, "-"))}">${esc(String(e.kind || "?").replace(/_/g, "-"))}</span><span class="f-msg">${esc(e.msg || "")}</span></li>`).join("") || `<li><span class="f-msg">No position-optimizer journal entries yet.</span></li>`}
-      </ul>
-    </details>`;
-}
-
-/* ── tvcli data sources: what the candle/confluence feeds found ───── */
-
-/* Debugging surface for every tvcli-backed consumer: which hop served
-   each candle fetch (direct / vision mirror / tvcli), and what the
-   screen's /hunt confluence pass found per skill. All from ctl /status
-   data_sources (fail-soft empty shapes). */
-function renderDataSources(st) {
-  const box = $("#opt-data-sources");
-  if (!box) return;
-  const ds = (st && typeof st.data_sources === "object"
-    && st.data_sources) || null;
-  if (!ds) {
-    box.innerHTML = `
-      <div class="card-head"><span class="card-title">tvcli data sources</span>
-        <span class="spacer"></span><span class="badge badge--warn" title="ctl /status not responding">offline</span></div>
-      <div class="card-body"><div class="empty-note">Data-source observability unavailable — this panel refills automatically once the daemon ctl plane is reachable again.</div></div>`;
-    return;
-  }
-  const events = Array.isArray(ds.fetch_events) ? ds.fetch_events : [];
-  const hs = (ds.hunt_stats && typeof ds.hunt_stats === "object")
-    ? ds.hunt_stats : {};
-  const skills = (hs.skills && typeof hs.skills === "object") ? hs.skills : {};
-  const hopCounts = {};
-  for (const e of events) {
-    const h = e && e.hop;
-    if (h) hopCounts[h] = (hopCounts[h] || 0) + 1;
-  }
-  const hops = Object.entries(hopCounts).sort((a, b) => b[1] - a[1]);
-  const hopBadge = (h) => h === "tvcli"
-    ? `<span class="badge badge--violet" title="TradingView WebSocket via the tvcli /fetch fallback">${esc(h)}</span>`
-    : h === "vision"
-      ? `<span class="badge badge--ok" title="Binance public data mirror (data-api.binance.vision)">${esc(h)}</span>`
-      : `<span class="badge badge--dim" title="primary venue API (e.g. Hyperliquid)">${esc(h)}</span>`;
-  const skillRows = Object.entries(skills).map(([name, s]) => {
-    const hunted = Number((s || {}).hunted) || 0;
-    const ok = Number((s || {}).ok) || 0;
-    const allOk = hunted > 0 && ok === hunted;
-    return `<tr>
-      <td class="td-mono">${esc(name)}</td>
-      <td class="td-mono">${ok}/${hunted}</td>
-      <td>${allOk ? '<span class="badge badge--ok">all parsed</span>' : hunted === 0 ? '<span class="badge badge--dim">not hunted</span>' : `<span class="badge badge--warn">${hunted - ok} failed</span>`}</td>
-    </tr>`;
-  }).join("");
-
-  box.innerHTML = `
-    <div class="card-head"><span class="card-title">tvcli data sources</span>
-      <span class="spacer"></span><span class="mono" style="font-size:10.5px;color:var(--ink-faint)" title="candle-hop attribution (market_regime fetch ring) + screen /hunt confluence counters — what the tvcli-backed systems found">${events.length ? `${events.length} recent fetch(es)` : "no fetches yet"}</span></div>
-    <div class="card-body"><div class="mini-kv">
-      <div class="row"><span class="k">candle hops</span><span class="v">${hops.length ? hops.map(([h, n]) => `${hopBadge(h)} \u00d7${n}`).join(" ") : "\u2014"}</span></div>
-      <div class="row"><span class="k">confluence boosted</span><span class="v" title="candidates whose score_final the tvcli bonus moved in the last screen">${esc(String(hs.candidates_boosted ?? "\u2014"))} candidate(s)</span></div>
-    </div></div>
-    ${skillRows ? `<div class="card-body--tight table-wrap">
-      <table class="ledger">
-        <thead><tr><th>hunt skill</th><th>ok / hunted</th><th>state</th></tr></thead>
-        <tbody>${skillRows}</tbody>
-      </table>
-    </div>` : `<div class="card-body"><div class="empty-note">No confluence hunt reported yet — the screen runs it over its top candidates (every rescreen).</div></div>`}
-    <details style="padding:10px 14px;border-top:1px solid var(--rule)">
-      <summary class="mono" style="font-size:11px;color:var(--ink-faint);cursor:pointer">candle fetch log \u00b7 last ${Math.min(events.length, 12)}</summary>
-      <ul class="feed" style="max-height:200px;overflow:auto">
-        ${events.slice(-12).reverse().map((e) => `<li><span class="f-at">${esc(relTimeEpoch(e && e.ts))}</span><span class="f-kind">${esc(String((e && e.venue) || "?"))}:${esc(String((e && e.symbol) || "?"))} ${esc(String((e && e.interval) || ""))}</span><span class="f-msg">${esc(String((e && e.hop) || "?"))} \u00b7 ${esc(String((e && e.rows) ?? "?"))} rows \u00b7 ${esc(String((e && e.ms) ?? "?"))} ms</span></li>`).join("") || `<li><span class="f-msg">No candle fetches recorded yet this daemon process.</span></li>`}
-      </ul>
-    </details>`;
-}
-
-/* ── fast-optimizer swap log + per-slot idle trackers ─────────────── */
-
-/* Two tables: (1) per-slot idle timing — when each slot last saw a
-   fill (the dials that drive the optimizer's idle flag), and (2) the
-   swap_log itself — every swap the loop has ATTEMPTED with the ok/not
-   verdict (a single cycle can record both a veto and the eventual
-   succeed once a different challenger cleared). The last arbiter
-   verdict is repeated here too in case the operator opened the tab
-   directly without seeing renderFastOptimizer. */
-function renderSwapLog(sl) {
-  const idTrack = $("#opt-trackers");
-  const idSwaps = $("#opt-swaps");
-  if (!idTrack && !idSwaps) return;
-  const trackers = (sl && sl.trackers) || [];
-  const swaps = (sl && sl.swaps) || [];
-  const arb = sl && sl.last_arbiter;
-  const meta = `<span class="mono" style="font-size:10.5px;color:var(--ink-faint)">${esc(sl ? (sl.cycles || 0) : 0)} cycles · ${esc(sl ? (sl.swaps_total || 0) : 0)} swaps total</span>`;
-  if (idTrack) {
-    idTrack.innerHTML = `
-      <div class="card-head"><span class="card-title">Per-slot idle trackers</span>
-        <span class="spacer"></span>${meta}</div>
-      <div class="card-body--tight table-wrap">
-        <table class="ledger">
-          <thead><tr><th>slot</th><th>last fills</th><th>idle (min)</th><th>last increase</th></tr></thead>
-          <tbody>
-            ${trackers.map((t) => {
-              const idle = t.idle_min;
-              const cls = idle == null ? "m-value--dim"
-                : idle >= 60 ? "m-value--bad"
-                : idle >= 15 ? "m-value--warn" : "m-value--dim";
-              return `<tr>
-                <td class="td-mono">${esc(t.slot ?? "—")}</td>
-                <td class="td-mono">${isNum(t.last_fills) ? fmtNum(t.last_fills, 1) : "—"}</td>
-                <td class="td-mono"><span class="${cls}">${idle == null ? "—" : fmtNum(idle, 0)}</span></td>
-                <td class="td-mono">${t.last_increase_at ? esc(relTimeEpoch(t.last_increase_at)) : "—"}</td>
-              </tr>`;
-            }).join("") || `<tr><td colspan="4"><div class="empty-note">No slot trackers yet — the first optimize cycle populates them.</div></td></tr>`}
-          </tbody>
-        </table>
-      </div>`;
-  }
-  if (idSwaps) {
-    const arbHead = arb && typeof arb === "object"
-      ? `<div class="card-head" style="padding:6px 0 0"><span class="card-title" style="font-size:12.5px">Last arbiter verdict</span>
-          <span class="spacer"></span>
-          ${arb.llm_degraded === true ? '<span class="badge badge--warn">degraded</span>' : `<span class="mono" style="font-size:10.5px;color:var(--ink-faint)">${esc(arb.llm || arb.provider || "mistral")}</span>`}
-        </div>
-        <div class="mini-kv" style="padding:4px 0 8px">
-          <div class="row"><span class="k">verdict</span><span class="v">${arb.approve === true ? '<span class="badge badge--ok">approve</span>' : '<span class="badge badge--bad">reject</span>'} · slot ${esc(arb.slot ?? "—")} → ${esc(arb.challenger || "—")} · conf ${isNum(arb.confidence) ? fmtNum(arb.confidence, 2) : "—"}</span></div>
-          ${arb.reason ? `<div class="row"><span class="k">reason</span><span class="v" title="${esc(arb.reason)}">${esc(arb.reason.slice(0, 200))}${arb.reason.length > 200 ? "…" : ""}</span></div>` : ""}
-        </div>` : "";
-    idSwaps.innerHTML = `
-      ${arbHead}
-      <div class="card-head"><span class="card-title">Swap log</span>
-        <span class="spacer"></span><span class="mono" style="font-size:10.5px;color:var(--ink-faint)">last ${swaps.length}</span></div>
-      <div class="card-body--tight table-wrap">
-        <table class="ledger">
-          <thead><tr><th>at</th><th>slot</th><th>verdict</th></tr></thead>
-          <tbody>
-            ${swaps.map((s) => `<tr>
-              <td class="td-mono" title="${esc(s.at_iso || String(s.at || ""))}">${s.at_iso ? esc(String(s.at_iso).replace("T", " ").slice(5, 16)) : esc(relTimeEpoch(s.at))}</td>
-              <td class="td-mono">${esc(s.slot ?? "—")}</td>
-              <td>${s.ok ? '<span class="badge badge--ok">swapped</span>' : '<span class="badge badge--bad">vetoed</span>'}</td>
-            </tr>`).join("") || `<tr><td colspan="3"><div class="empty-note">No swaps yet — the optimizer cycles every ${esc("2–5")} min; a swap only happens when the arbiter approves one inside the relaxed Δscore band.</div></td></tr>`}
-          </tbody>
-        </table>
-      </div>`;
-  }
+  // Standalone-only: /api/optimizer always reports applicable:false in
+  // this workspace (GridStrategy revalues the grid in-strategy every
+  // candle). The WT-era slow-loop recommendation panel is retired with
+  // the brain — the live panel below is the freqtrade counterpart.
+  renderStandaloneOptimizer(d || {});
 }
 
 /* ── reliability ──────────────────────────────────────────────────── */
@@ -1768,25 +1330,19 @@ async function loadReliability() {
   let rel;
   try { rel = await api("/api/reliability"); }
   catch (e) { toast(`reliability: ${e.message}`, true); return; }
-  renderFreshnessBanner("rel-freshness", rel && rel.freshness);
   const ladder = rel.ladder || {};
   const archs = Object.entries(rel.archetypes || {}).sort((a, b) =>
     (b[1].samples || 0) - (a[1].samples || 0));
 
-  // snapshot-staleness note: the ledger is a file snapshot refreshed by the
-  // daemon's 24h health cycle — past that (+grace) it is stale evidence.
   const noteBox = $("#rel-note");
   if (noteBox) {
-    const age = rel.ledger_age_h;
     const notes = [];
-    if (rel.stale) {
-      notes.push(`<div class="banner banner--warn"><div><div class="banner-title">Reliability ledger is a stale snapshot (${fmtNum(age, 1)}h old)</div>
-        The 24h refresh cadence has been missed — the daemon may be down or its health cycle has not run. Treat every aggregate below as last-known, not live.</div></div>`);
-    } else if (rel.missing || (rel.note && !rel.stale)) {
-      notes.push(`<div class="banner banner--info"><div>${esc(rel.note || "No closed round-trips yet.")}</div></div>`);
-    } else if (age != null) {
-      notes.push(`<div class="banner banner--info"><div>Ledger snapshot age: <b>${fmtNum(age, 1)}h</b> (refresh cadence ${esc(rel.refresh_cadence_h ?? 24)}h).</div></div>`);
-    }
+    // live-source banner: the primary ladder is computed from the dry-run
+    // fleet's trades DBs via the M4 toolchain — it fills as trips close
+    const fresh = rel.engine_freshness || rel.freshness;
+    notes.push(`<div class="banner banner--engine" style="display:block"><div>
+      <div class="banner-title">Live ledger — computed from the dry-run fleet’s trades DBs</div>
+      Derived via the M4 toolchain (pairing.from_sqlite → ledger math) from <code class="mono">state/ft_fleet/&lt;bot&gt;/tradesv3.dryrun.sqlite</code>${fresh && fresh.age_s != null ? ` · last trade activity ${fmtNum(Math.round(fresh.age_s / 60), 0)}m ago` : ""}. Samples are closed grid round-trips only — no synthetic seeds, no WT-era pollution.</div></div>`);
     const anySynth = archs.some(([, s]) => (s.synthetic_samples || 0) > 0);
     if (anySynth) {
       notes.push(`<div class="banner banner--bad"><div><div class="banner-title">Synthetic/seeded samples pollute the ledger</div>
@@ -1847,12 +1403,43 @@ async function loadReliability() {
       <td class="td-mono">${fmtUsd(s.max_dd_usd)}</td>
       <td><span class="badge ${tierBadge}">${esc(s.tier)}</span></td>
     </tr>`;
-  }).join("") || `<tr><td colspan="11"><div class="empty-note">No closed round-trips yet — the ledger fills as bots complete trades (24h refresh, or force one from Fleet).</div></td></tr>`;
+  }).join("") || `<tr><td colspan="11"><div class="empty-note">No closed round-trips yet — the ledger fills as the dry-run fleet completes grid trips (live from the trades DBs, no file refresh needed).</div></td></tr>`;
   wireReliabilityExpansion();
+
+  // WT-era file snapshot — labeled secondary block, shown only while the
+  // file still exists on disk (gone after grid/dev reset --yes)
+  const fileBox = $("#rel-file");
+  if (fileBox) {
+    const fileArchs = Object.entries(rel.file_ledger || {}).sort((a, b) =>
+      (b[1].samples || 0) - (a[1].samples || 0));
+    if (fileArchs.length) {
+      const rowsHtml = fileArchs.map(([name, s]) => `
+        <tr>
+          <td><b>${esc(name)}</b></td>
+          <td class="td-mono">${esc(s.samples ?? 0)}</td>
+          <td class="td-mono">${esc(s.real_samples ?? s.samples ?? 0)} / ${esc(s.synthetic_samples || 0)}</td>
+          <td class="td-mono">${esc(fmtNum(s.profit_factor_real ?? s.profit_factor ?? 0, 2))}</td>
+          <td class="td-mono">${esc(fmtNum(s.recent_pf_real ?? s.recent_pf ?? 0, 2))}</td>
+          <td><span class="badge badge--dim">${esc(s.tier || "—")}</span></td>
+        </tr>`).join("");
+      const ff = rel.file_freshness;
+      fileBox.innerHTML = `
+        <div class="card">
+          <div class="card-head"><span class="card-title">WT-era snapshot — <code class="mono">state/reliability.json</code> (frozen)</span>
+            <span class="sub" style="color:var(--ink-faint)">${ff && ff.at_iso ? `last written ${esc(String(ff.at_iso).slice(0, 16).replace("T", " "))}Z` : ""} · preserved on disk, never updated by the standalone stack</span></div>
+          <div class="card-body--tight table-wrap">
+            <table class="ledger">
+              <thead><tr><th>archetype</th><th>samples</th><th>real / synth</th><th>PF</th><th>recent PF</th><th>tier</th></tr></thead>
+              <tbody>${rowsHtml}</tbody>
+            </table>
+          </div>
+        </div>`;
+    } else {
+      fileBox.innerHTML = "";
+    }
+  }
 }
 
-/* Lazy-load /api/reliability/archive and inject a sub-row with the recent
-   closed round-trips. First click fetches; subsequent clicks toggle. */
 function wireReliabilityExpansion() {
   for (const row of document.querySelectorAll("#rel-body tr.rel-row")) {
     const open = () => toggleReliabilityRow(row);

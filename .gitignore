@@ -46,3 +46,5 @@ grid/.pocketbase/
 .venv-ft/
 ft_user_data/
 Agents.md
+# grid/dev reset backups (state.reset-<timestamp>/ siblings of grid/state/)
+grid/state.*/

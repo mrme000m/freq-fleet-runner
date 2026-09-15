@@ -4,10 +4,14 @@
 Usage:
   grid/dev status                     everything at a glance
   grid/dev start [--no-ft] [--no-console]
-  grid/dev stop  [--keep-ft] [--keep-console]
+  grid/dev stop  [--keep-ft] [--keep-console] [--keep-pb]
   grid/dev restart
+  grid/dev reset --yes                full reset: stop the stack, archive
+                                      state/ to state.reset-<ts>/ (backup
+                                      kept), recreate it clean (carries
+                                      engine.json + llm.env over)
   grid/dev pb [start|stop|status]     workspace PocketBase lifecycle
-  grid/dev logs [ft|console|pb] [lines]
+  grid/dev logs [ft|console|pb|<bot>] [lines]
   grid/dev open                      open the console #fleet page in a browser
   grid/dev ledger                    reliability-ledger summary (M4)
 
@@ -18,12 +22,13 @@ What this manages (the standalone runtime):
               NOT the M3 stack's 8090: the two runtimes must never cross-wire.
   console   grid/console/server.py on 127.0.0.1:8798 — the mission console
             (state: grid/state/, engine banner from state/engine.json)
-  engine    one dry-run freqtrade process — GridStrategy on BTC/USDC:USDC 1h
-            (Hyperliquid public data, .venv-ft, M2-tuned params band_atr 4.2 /
-            step_factor 0.21). The instance dir + registry entry live in
-            grid/state/ft_fleet/ft-btc/ using the SAME layout and entry
+  engine    the dry-run freqtrade fleet — 4 slots × 150 USDC on Hyperliquid
+            USDC perps (BTC / ETH / SOL / HYPE, 1h, GridStrategy with the
+            M2-tuned params band_atr 4.2 / step_factor 0.21; pairs verified
+            active in ccxt). Instance dirs + registry entries live in
+            grid/state/ft_fleet/<bot>/ using the SAME layout and entry
             schema as the M3 backend, so the console fleet row (and the M3
-            daemon, once it lands) read it natively.
+            daemon, once it lands) read them natively.
 
 What this deliberately does NOT manage:
   the autonomy brain (screen → LLM swarm → deploy). It is still M3-in-flight
@@ -72,10 +77,15 @@ ENGINE_BASE_PORT = 8191                           # M3's backend allocates
                                                   # clear of that range so a
                                                   # concurrent M3 smoke can
                                                   # never collide with ours
-BOT_CODE = "ft-btc"
-BOT_DIR = FLEET / BOT_CODE
-PAIR = "BTC/USDC:USDC"
-DRY_RUN_WALLET = 1000.0                          # the M2 research budget
+# the standalone fleet: 4 slots × 150 USDC, one Hyperliquid USDC perp per
+# slot (all verified active in ccxt before being listed here)
+SLOTS = {
+    "ft-btc":  ("BTC/USDC:USDC",  "BTCUSDC"),
+    "ft-eth":  ("ETH/USDC:USDC",  "ETHUSDC"),
+    "ft-sol":  ("SOL/USDC:USDC",  "SOLUSDC"),
+    "ft-hype": ("HYPE/USDC:USDC", "HYPEUSDC"),
+}
+DRY_RUN_WALLET = 150.0                           # per slot — 4 × 150 = 600
 
 FT_BIN = WS / ".venv-ft" / "bin" / "freqtrade"    # load-bearing for M3 — read-only use
 STRATEGY_SRC = GRID / "strategies"               # GridStrategy.py/.json + grid_geometry.py
@@ -173,7 +183,7 @@ def save_registry(reg):
 
 # ── engine (dry-run freqtrade instance) ─────────────────────────────────
 
-def engine_config(port, username, password):
+def engine_config(port, username, password, pair, pair_code):
     """The instance config — mirrors the verified ft_user_data/config.json
     (hyperliquid futures/isolated dry-run, backtested M1/M2 shape) plus the
     api_server + initial_state the M3 backend adds per instance."""
@@ -181,7 +191,7 @@ def engine_config(port, username, password):
         "exchange": {
             "name": "hyperliquid", "key": "", "secret": "",
             "ccxt_config": {}, "ccxt_async_config": {},
-            "pair_whitelist": [PAIR], "pair_blacklist": [],
+            "pair_whitelist": [pair], "pair_blacklist": [],
         },
         "trading_mode": "futures",
         "margin_mode": "isolated",
@@ -212,12 +222,14 @@ def engine_config(port, username, password):
     }
 
 
-def materialize():
-    """Create/refresh the instance dir + registry entry (idempotent).
+def materialize(bot_code):
+    """Create/refresh one instance dir + registry entry (idempotent).
     Reuses an existing entry's port/credentials so a restarted instance
     keeps its trades database and console identity."""
+    pair, pair_code = SLOTS[bot_code]
+    bot_dir = FLEET / bot_code
     reg = load_registry()
-    entry = reg["instances"].get(BOT_CODE)
+    entry = reg["instances"].get(bot_code)
 
     port = username = password = None
     if entry and entry.get("username") and entry.get("password"):
@@ -234,22 +246,23 @@ def materialize():
     if not password:
         password = secrets.token_urlsafe(12)
 
-    BOT_DIR.mkdir(parents=True, exist_ok=True)
-    (BOT_DIR / "strategies").mkdir(exist_ok=True)
+    bot_dir.mkdir(parents=True, exist_ok=True)
+    (bot_dir / "strategies").mkdir(exist_ok=True)
     for fn in STRATEGY_FILES:
-        shutil.copy2(STRATEGY_SRC / fn, BOT_DIR / "strategies" / fn)
-    with open(BOT_DIR / "config.json", "w") as f:
-        json.dump(engine_config(port, username, password), f, indent=2)
+        shutil.copy2(STRATEGY_SRC / fn, bot_dir / "strategies" / fn)
+    with open(bot_dir / "config.json", "w") as f:
+        json.dump(engine_config(port, username, password, pair, pair_code),
+                  f, indent=2)
 
     entry = {
-        "bot_code": BOT_CODE,
-        "dir": str(BOT_DIR),
+        "bot_code": bot_code,
+        "dir": str(bot_dir),
         "port": int(port),
         "username": username,
         "password": password,      # secrets live ONLY here + config.json
-        "pair": PAIR,
-        "pair_code": "BTCUSDC",
-        "symbol": "BTCUSDC",
+        "pair": pair,
+        "pair_code": pair_code,
+        "symbol": pair_code,
         "venue": "hyperliquid",
         "exchange_code": "HYPERLIQUID_SWAP",
         "grid_type": "long",
@@ -267,40 +280,38 @@ def materialize():
         "backend": "freqtrade-dry-run",
         "spawned_by": "grid/dev",
     }
-    reg["instances"][BOT_CODE] = entry
+    reg["instances"][bot_code] = entry
     save_registry(reg)
     return entry
 
 
-def _is_ours(pid):
+def _is_ours(pid, bot_dir=None):
     """A listener pid is our engine only if it's a freqtrade process under
     OUR userdir — never adopt a concurrent M3 smoke instance."""
     try:
         out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
                              capture_output=True, text=True, timeout=5).stdout
-        return "freqtrade" in out and str(BOT_DIR) in out
+        return "freqtrade" in out and str(bot_dir or FLEET) in out
     except Exception:
         return False
 
 
 def engine_running(entry=None):
-    entry = entry or load_registry()["instances"].get(BOT_CODE)
-    if not entry:
+    """(running, pid) for ONE registry entry; (False, None) when the
+    entry is absent — the fleet loop materializes missing bots itself,
+    so a missing entry must never fall back to another slot's state."""
+    if not isinstance(entry, dict):
         return False, None
-    pid = entry.get("pid") or _pidfile_read(BOT_CODE)
+    pid = entry.get("pid") or _pidfile_read(entry.get("bot_code"))
     if pid and _alive(pid):
         return True, int(pid)
     p = _port_pid(entry.get("port"))
-    if p and _is_ours(p):
+    if p and _is_ours(p, entry.get("dir")):
         return True, p
     return False, None
 
 
 def engine_start():
-    running, pid = engine_running()
-    if running:
-        print(f"engine ft-btc already running (pid {pid})")
-        return
     if not FT_BIN.is_file():
         sys.exit(f"missing freqtrade binary: {FT_BIN} (.venv-ft is "
                  "path-load-bearing for M3 — do not move/rename)")
@@ -308,46 +319,69 @@ def engine_start():
         if not (STRATEGY_SRC / fn).is_file():
             sys.exit(f"missing strategy file: {STRATEGY_SRC / fn}")
 
-    entry = materialize()
-    port = int(entry["port"])
-    if _port_pid(port):
-        sys.exit(f"port {port} already in use but no live engine — "
-                 f"investigate (lsof -iTCP:{port})")
-
     env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
     env["PYTHONUNBUFFERED"] = "1"
-    log = open(BOT_DIR / "freqtrade.log", "ab")
-    proc = subprocess.Popen(
-        [str(FT_BIN), "trade", "--dry-run", "--userdir", str(BOT_DIR),
-         "--config", str(BOT_DIR / "config.json")],
-        stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-        start_new_session=True, env=env, cwd=str(BOT_DIR))
-    _pidfile_write(BOT_CODE, proc.pid)
-
-    reg = load_registry()
-    reg["instances"][BOT_CODE]["pid"] = proc.pid
-    reg["instances"][BOT_CODE]["status"] = "starting"
-    save_registry(reg)
-
-    print(f"engine ft-btc starting (pid {proc.pid}, port {port}, "
-          f"{PAIR} 1h DRY-RUN, Hyperliquid) — waiting for /ping …")
-    t0 = time.time()
-    while time.time() - t0 < READY_TIMEOUT_S:
-        if not _alive(proc.pid):
-            tail = _tail(BOT_DIR / "freqtrade.log", 5)
-            sys.exit("engine died during startup. Last log lines:\n  " +
-                     "\n  ".join(tail))
-        if _http_ok(f"http://127.0.0.1:{port}/api/v1/ping", timeout=2):
-            reg = load_registry()
-            reg["instances"][BOT_CODE]["status"] = "running"
-            reg["instances"][BOT_CODE]["pid"] = proc.pid
+    spawned = []
+    for bot_code in SLOTS:
+        running, pid = engine_running(
+            load_registry()["instances"].get(bot_code))
+        if running:
+            print(f"engine {bot_code} already running (pid {pid})")
+            continue
+        entry = materialize(bot_code)
+        port = int(entry["port"])
+        if _port_pid(port):
+            print(f"NOTICE: port {port} in use but no live {bot_code} — "
+                  f"skipping (investigate: lsof -iTCP:{port})")
+            continue
+        bot_dir = FLEET / bot_code
+        log = open(bot_dir / "freqtrade.log", "ab")
+        proc = subprocess.Popen(
+            [str(FT_BIN), "trade", "--dry-run", "--userdir", str(bot_dir),
+             "--config", str(bot_dir / "config.json")],
+            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            start_new_session=True, env=env, cwd=str(bot_dir))
+        _pidfile_write(bot_code, proc.pid)
+        reg = load_registry()
+        if bot_code in reg["instances"]:
+            reg["instances"][bot_code]["pid"] = proc.pid
+            reg["instances"][bot_code]["status"] = "starting"
             save_registry(reg)
-            print(f"engine ft-btc READY ({int(time.time() - t0)}s) — "
-                  f"API http://127.0.0.1:{port}/  · dry-run paper only")
-            return
-        time.sleep(2)
-    print(f"engine not ready after {READY_TIMEOUT_S}s — it may still be "
-          f"loading market data; check: grid/dev logs ft")
+        print(f"engine {bot_code} starting (pid {proc.pid}, port {port}, "
+              f"{SLOTS[bot_code][0]} 1h DRY-RUN · wallet {DRY_RUN_WALLET}, "
+              f"Hyperliquid)")
+        spawned.append((bot_code, bot_dir, proc, port))
+    if not spawned:
+        return
+    # wait for every spawned engine's /ping in parallel — Hyperliquid
+    # startup data is slow and 4 sequential waits would take 4× as long
+    t0 = time.time()
+    pending = list(spawned)
+    while pending and time.time() - t0 < READY_TIMEOUT_S:
+        for item in pending[:]:
+            bot_code, bot_dir, proc, port = item
+            if not _alive(proc.pid):
+                print(f"engine {bot_code} DIED during startup. Last log "
+                      "lines:")
+                for line in _tail(bot_dir / "freqtrade.log", 5):
+                    print("  " + line)
+                pending.remove(item)
+                continue
+            if _http_ok(f"http://127.0.0.1:{port}/api/v1/ping", timeout=2):
+                reg = load_registry()
+                if bot_code in reg["instances"]:
+                    reg["instances"][bot_code]["status"] = "running"
+                    save_registry(reg)
+                print(f"engine {bot_code} READY "
+                      f"({int(time.time() - t0)}s) — API "
+                      f"http://127.0.0.1:{port}/ · dry-run paper only")
+                pending.remove(item)
+        if pending:
+            time.sleep(2)
+    for bot_code, bot_dir, *_ in pending:
+        print(f"engine {bot_code} not ready after {READY_TIMEOUT_S}s — it "
+              f"may still be loading market data; check: "
+              f"grid/dev logs {bot_code}")
 
 
 def _terminate(pid, grace_s=STOP_GRACE_S):
@@ -371,19 +405,24 @@ def _terminate(pid, grace_s=STOP_GRACE_S):
 
 def engine_stop():
     reg = load_registry()
-    entry = reg["instances"].get(BOT_CODE)
-    running, pid = engine_running(entry)
-    if not running:
-        print("engine ft-btc already stopped")
-    else:
-        ok = _terminate(pid)
-        print(f"engine ft-btc {'stopped' if ok else 'FAILED to stop'} "
-              f"(was pid {pid})")
-    if entry:
+    stopped = 0
+    for bot_code, entry in sorted(reg["instances"].items()):
+        if not isinstance(entry, dict):
+            continue
+        running, pid = engine_running(entry)
+        if not running:
+            print(f"engine {bot_code} already stopped")
+        else:
+            ok = _terminate(pid)
+            stopped += 1
+            print(f"engine {bot_code} {'stopped' if ok else 'FAILED to stop'} "
+                  f"(was pid {pid})")
         entry["pid"] = None
         entry["status"] = "stopped"
-        save_registry(reg)
-    _pidfile_clear(BOT_CODE)
+        _pidfile_clear(bot_code)
+    save_registry(reg)
+    if not stopped and not reg["instances"]:
+        print("no fleet instances registered")
 
 
 # ── pocketbase (vendored workspace sidecar, 127.0.0.1:8290) ─────────────
@@ -608,27 +647,27 @@ def cmd_status():
              if running else
              f"  → start: {Path(__file__).name} start"))
     reg = load_registry()
-    entry = reg["instances"].get(BOT_CODE)
-    running, pid = engine_running(entry)
-    if running:
-        ping = _http_ok(
-            f"http://127.0.0.1:{entry.get('port')}/api/v1/ping", 2)
-        print(f"engine ft-btc    : RUNNING (pid {pid}, port "
-              f"{entry.get('port')}, API {'ok' if ping else 'unreachable'}) · "
-              f"{entry.get('pair')} 1h DRY-RUN")
-        trades = BOT_DIR / "tradesv3.dryrun.sqlite"
-        print(f"                   dry-run trades db: "
-              f"{trades if trades.exists() else '(none yet)'}")
-    elif entry:
-        print(f"engine ft-btc    : stopped (port {entry.get('port')}) · "
-              f"{entry.get('pair')} 1h dry-run — start: "
-              f"{Path(__file__).name} start")
-    else:
-        print(f"engine ft-btc    : not created — "
-              f"start: {Path(__file__).name} start")
+    codes = sorted(set(list(reg["instances"]) + list(SLOTS)))
+    for bot_code in codes:
+        entry = reg["instances"].get(bot_code)
+        running, pid = engine_running(entry)
+        if running:
+            ping = _http_ok(
+                f"http://127.0.0.1:{entry.get('port')}/api/v1/ping", 2)
+            print(f"engine {bot_code:9s}: RUNNING (pid {pid}, port "
+                  f"{entry.get('port')}, API {'ok' if ping else 'unreachable'}) · "
+                  f"{entry.get('pair')} 1h DRY-RUN · "
+                  f"{entry.get('slot_balance')} USDC slot")
+        elif entry:
+            print(f"engine {bot_code:9s}: stopped (port {entry.get('port')}) · "
+                  f"{entry.get('pair')} 1h dry-run — start: "
+                  f"{Path(__file__).name} start")
+        else:
+            print(f"engine {bot_code:9s}: not created — "
+                  f"start: {Path(__file__).name} start")
     arch = len(reg.get("archived") or [])
     print(f"ft_fleet registry: {len(reg['instances'])} instance(s) · "
-          f"{arch} archived")
+          f"{arch} archived · {len(SLOTS)} slots × {DRY_RUN_WALLET} USDC")
     print(f"brain (autonomy) : NOT in this repo — M3 in flight in "
           f"grid-autonomy; the WT-era daemon was closed with the legacy "
           f"engine (see state/engine.json)")
@@ -642,11 +681,50 @@ def cmd_logs(which="ft", n=40):
         path, label = CONSOLE_LOG, "console"
     elif which == "pb":
         path, label = STATE / "logs" / "pb.log", "pocketbase"
+    elif which in SLOTS:
+        path, label = FLEET / which / "freqtrade.log", f"engine {which}"
     else:
-        path, label = BOT_DIR / "freqtrade.log", "engine ft-btc"
+        path, label = FLEET / "ft-btc" / "freqtrade.log", "engine ft-btc"
     print(f"── {label}: last {n} lines of {path} " + "─" * 20)
     for line in _tail(path, n):
         print(line)
+
+
+def cmd_reset(yes=False):
+    """Full reset: stop the whole stack, archive grid/state/ to a
+    timestamped backup sibling, recreate it clean. engine.json (the
+    engine declaration) and llm.env (the LLM sidecar keys) are carried
+    over — they are wiring/config, not runtime state. The WT-era frozen
+    archives (decisions journal, reports, reliability files) move to the
+    backup: preserved on disk, gone from the console."""
+    if not yes:
+        print("reset is destructive — pass --yes to confirm. state/ is "
+              "archived to a state.reset-<timestamp>/ sibling first, and "
+              "engine.json + llm.env are carried over.")
+        sys.exit(2)
+    engine_stop()
+    console_stop()
+    pb_stop()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    backup = GRID / f"state.reset-{stamp}"
+    if STATE.exists():
+        os.rename(STATE, backup)
+        print(f"state archived  : {backup}")
+    STATE.mkdir(parents=True, exist_ok=True)
+    (STATE / "logs").mkdir(exist_ok=True)
+    (STATE / "pids").mkdir(exist_ok=True)
+    FLEET.mkdir(parents=True, exist_ok=True)
+    carried = []
+    for name in ("engine.json", "llm.env"):
+        src = backup / name
+        if src.is_file():
+            shutil.copy2(src, STATE / name)
+            carried.append(name)
+    if "llm.env" in carried:
+        os.chmod(STATE / "llm.env", 0o600)
+    if carried:
+        print(f"carried over    : {', '.join(carried)}")
+    print("state is clean — start the fleet: grid/dev start")
 
 
 def main(argv):
@@ -681,6 +759,8 @@ def main(argv):
         which = args[0] if args else "ft"
         n = int(args[1]) if len(args) > 1 else 40
         cmd_logs(which, n)
+    elif cmd == "reset":
+        cmd_reset("--yes" in args)
     elif cmd == "open":
         import webbrowser
         url = f"http://127.0.0.1:{CONSOLE_PORT}/#fleet"

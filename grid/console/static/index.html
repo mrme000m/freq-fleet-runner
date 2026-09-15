@@ -125,7 +125,7 @@
   <section class="view" id="view-optimizer" role="tabpanel" aria-labelledby="tab-optimizer" hidden>
     <div class="view-head">
       <h2>Position optimizer</h2>
-      <span class="sub">Slow-loop recommendations (fresh-candle grid revaluation, TP/SL/trailing exit scoring) — advisory by default, each with its apply-gate verdict.</span>
+      <span class="sub">No separate optimizer applies in this workspace: GridStrategy revalues the ATR channel and grid lines in-strategy every candle. The panel shows the deployed geometry, the tuned params and the live reliability ledger.</span>
     </div>
     <div class="card" id="opt-fast"></div>
     <p></p>
@@ -173,7 +173,7 @@
       <h2>Reliability ledger</h2>
       <span class="sub">Closed round-trips per regime archetype gate the sizing ladder: base &lt;10 samples → probe ≥10 → full ≥30 &amp; PF ≥1.3; recent PF &lt;1.0 kills the archetype.</span>
     </div>
-    <div class="view-head"><span class="sub">Aggregates come from the daemon’s snapshot ledger (24h refresh). Synthetic/seeded samples are counted out of the real-sample column; expectancies and PF are only trustworthy when the synthetic count is zero.</span></div>
+    <div class="view-head"><span class="sub">Aggregates are computed live from the dry-run fleet's trades DBs (M4 pairing → ledger math) — samples are closed grid round-trips only; there are no synthetic seeds and no WT-era pollution in the primary table.</span></div>
     <div class="banner-slot" id="rel-freshness"></div>
     <div id="rel-note"></div>
     <div class="card"><div class="card-body--tight table-wrap">
@@ -185,6 +185,7 @@
         <tbody id="rel-body"></tbody>
       </table>
     </div></div>
+    <div id="rel-file"></div>
   </section>
 
   <!-- ══ CONFIG ══ -->
