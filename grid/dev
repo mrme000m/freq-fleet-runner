@@ -17,7 +17,14 @@ Usage:
   grid/dev ledger-sync               ingest every instance's live tradesv3.sqlite
                                      into the ledger + archive (M4 cron seam)
   grid/dev screen [--top N]          rank Hyperliquid USDC perps by ATR%×volume
-  grid/dev rotate [--top N] [--yes]  swap weak slots onto top-ranked pairs
+  grid/dev rotate [--top N] [--llm] [--yes]
+                                     swap weak slots onto top-ranked pairs;
+                                     --llm filters every candidate through the
+                                     Mistral-driven swarm (grid.agents) so
+                                     only GO tickets land
+  grid/dev evaluate <SYM> [--from-row N]
+                                     run the swarm on one screen-cache entry
+                                     (no state mutation — print ticket only)
 
 What this manages (the standalone runtime):
   pocketbase  the vendored PocketBase sidecar on 127.0.0.1:8290 (grid/.pocketbase/,
@@ -829,9 +836,16 @@ def cmd_rotate(args):
     screen list. Proposes swaps, then (with --yes) stops the affected
     engines, rematerializes them onto the best unheld ranked pairs, writes
     the override to state/slots.json, and restarts the fleet. Dry-run only:
-    the instances trade paper, never live."""
+    the instances trade paper, never live.
+
+    --llm: filter every candidate through the LLM swarm (Mistral-driven
+           deliberation, ported as grid.agents.deliberate). NO_GO tickets
+           are dropped from the swap list with a printed rationale;
+           llm_degraded tickets pass through (rule-fallback) so an LLM
+           outage never blocks the loop."""
     top = _arg_int(args, "--top", len(SLOTS))
     yes = "--yes" in args
+    use_llm = "--llm" in args
     cache = STATE / "screen_cache.json"
     if not cache.is_file():
         sys.exit("no screen cache — run: grid/dev screen first")
@@ -853,18 +867,35 @@ def cmd_rotate(args):
 
     held = {pair for pair, _c in slots.values()}
     available = [p for p in ranked if p["pair"] not in held]
-    over, swaps = {}, []
+    over, swaps, skipped = {}, [], []
     for code in weak:
         if not available:
             print(f"no unheld ranked pairs left to swap into {code}")
             break
         pick = available.pop(0)
+        if use_llm:
+            ticket = _swarm_ticket(pick, current_pair=slots[code][0])
+            verdict = ticket.get("decision", "NO_GO")
+            if verdict != "GO":
+                skipped.append((code, slots[code][0], pick["pair"],
+                                ticket.get("veto") or ticket.get(
+                                    "rationale", ""), ticket.get(
+                                    "llm_degraded", False)))
+                continue
         over[code] = [pick["pair"], pick["pair_code"]]
         swaps.append((code, slots[code][0], pick["pair"]))
 
     print(f"proposed swaps ({len(swaps)}):")
     for code, old, new in swaps:
         print(f"  {code}: {old} -> {new}")
+    if skipped:
+        print(f"skipped by swarm ({len(skipped)}):")
+        for code, old, new, why, degraded in skipped:
+            tag = " [degraded]" if degraded else ""
+            print(f"  {code}: {old} -> {new}  ({why}){tag}")
+    if not swaps:
+        print("nothing to swap — every candidate vetoed (or no candidates)")
+        return
     if not yes:
         print("re-run with --yes to apply (stops affected engines, "
               "rematerializes, writes state/slots.json, restarts)")
@@ -904,6 +935,126 @@ def cmd_rotate(args):
     engine_start()
     print(f"rotate done — {len(swaps)} slot(s) swapped; override at "
           f"{SLOTS_OVERRIDE}")
+
+
+def _swarm_ticket(screen_row, current_pair=""):
+    """Run the LLM swarm (Mistral-driven deliberation) on one screen row.
+
+    Builds the brief from the screen cache + the live reliability ledger
+    bucket for the candidate's regime/archetype (so the swarm sees past
+    outcomes), calls grid.agents.deliberate, and returns the ticket dict.
+    Never raises — on total failure returns a rule-fallback NO_GO so a
+    broken swarm can't approve a swap.
+
+    The score_final feed into the brief uses screen_row['score'] scaled to
+    ~0–100 to match the regime gate (rule-fallback facilitator uses
+    score_final > 45 = GO; the live LLM also benefits from the same
+    framing). ATR%/volume come from the screen row.
+    """
+    try:
+        sys.path.insert(0, str(WS))
+        from grid.agents import deliberate as _deliberate
+    except Exception as exc:
+        return {"decision": "NO_GO", "veto": f"agents unavailable: {exc}",
+                "llm_degraded": True}
+
+    coin = screen_row.get("coin") or screen_row.get("pair", "").split("/")[0]
+    pair = screen_row.get("pair", "")
+    atr = screen_row.get("atr_pct") or 0.0
+    vol = screen_row.get("dayNtlVlm") or 0.0
+    score = screen_row.get("score") or 0.0
+    # regime heuristic: ATR% > 2.5 + not extreme vol → trend_up (long grid)
+    # ATR% in [0.8, 2.5] → chop (neutral); ATR% < 0.8 → skip-grade flat
+    regime = ("trend_up" if atr >= 2.5 else
+              "chop_high_volatility" if atr >= 0.8 else "neutral")
+
+    # pull the live ledger bucket (size + PF) so the swarm sees evidence
+    evidence = {}
+    try:
+        from grid.reliability import ledger as _m4
+        led = (json.loads(RELIABILITY.read_text())
+               if RELIABILITY.is_file() else {})
+        key = _m4.ledger_key(LADDER_ARCHETYPE)
+        st = led.get(key) if isinstance(led, dict) else None
+        if isinstance(st, dict):
+            evidence = {"samples": st.get("samples"),
+                        "profit_factor": st.get("profit_factor"),
+                        "recent_pf": st.get("recent_pf")}
+    except Exception:
+        pass
+
+    brief = {
+        "symbol": coin, "tv_symbol": f"BINANCE:{coin}USDT",
+        "venue": "hyperliquid", "regime": regime,
+        # score_final is the unitless 0–100 score the facilitator gate
+        # expects. Volume×ATR is in the 10^9 range; rescale to ≈ 0–100
+        # by dividing by 1e8 and clamping, so the LLM and the
+        # rule-fallback agree on a sensible gate.
+        "score_final": max(0.0, min(100.0, score / 1e8)),
+        "step": round(atr, 4),
+        "spread_pct": 0.02,
+        "metrics": {"price": 0.0, "atr_pct": atr, "adx14": 20.0,
+                    "rsi14": 50.0, "bb_width_pctile": 50.0},
+        "confluence_notes": ([f"score={score:.0f}", f"vol=${vol:.0f}",
+                              f"atr={atr}%"]),
+        "evidence": evidence,
+        "stagnation_policy": {"min_hold_h": 24},
+        "slot": {"slot": 0, "balance": DRY_RUN_WALLET,
+                 "max_commitment": DRY_RUN_WALLET * 0.5,
+                 "current_pair": current_pair},
+    }
+    try:
+        return _deliberate(brief)
+    except Exception as exc:
+        return {"decision": "NO_GO", "veto": f"deliberate raised: {exc}",
+                "llm_degraded": True}
+
+
+def cmd_evaluate(args):
+    """Run the LLM swarm on a single symbol (no state mutation).
+
+    Usage:
+      grid/dev evaluate BTC        # by coin symbol (uses screen cache)
+      grid/dev evaluate BTC --from-row 3
+                                  # pick the Nth-ranked row from the cache
+    Prints the full ticket (decision, grid_type, rationale, risk notes,
+    llm_degraded, facilitator provider). Never applies anything; use
+    `rotate --llm --yes` to act on the swarm's verdict.
+    """
+    if not args:
+        sys.exit("usage: grid/dev evaluate <SYMBOL> [--from-row N]")
+    symbol = args[0].upper()
+    from_row = None
+    if "--from-row" in args:
+        try:
+            from_row = int(args[args.index("--from-row") + 1])
+        except (ValueError, IndexError):
+            sys.exit("--from-row needs an integer argument")
+
+    cache = STATE / "screen_cache.json"
+    row = None
+    if cache.is_file():
+        try:
+            ranked = (json.loads(cache.read_text()) or {}).get("pairs") or []
+        except Exception:
+            ranked = []
+        if from_row is not None and 0 <= from_row < len(ranked):
+            row = ranked[from_row]
+        else:
+            for r in ranked:
+                if isinstance(r, dict) and r.get("coin") == symbol:
+                    row = r
+                    break
+    if row is None:
+        sys.exit(f"{symbol} not found in screen cache — run: grid/dev screen")
+
+    ticket = _swarm_ticket(row)
+    print(json.dumps({
+        "symbol": symbol,
+        "screen_score": row.get("score"),
+        "atr_pct": row.get("atr_pct"),
+        "ticket": ticket,
+    }, indent=2))
 
 
 def cmd_ledger_sync():
@@ -977,6 +1128,8 @@ def main(argv):
         cmd_screen(args)
     elif cmd == "rotate":
         cmd_rotate(args)
+    elif cmd == "evaluate":
+        cmd_evaluate(args)
     else:
         print(__doc__)
         sys.exit(2)
