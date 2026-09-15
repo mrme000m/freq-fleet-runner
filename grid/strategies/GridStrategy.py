@@ -192,10 +192,44 @@ class GridStrategy(IStrategy):
             return False
 
     def _grid_state_path(self):
+        """Resolve a per-instance writable path for grid_state.json.
+
+        Walks up from this strategy file's directory until it finds the
+        freqtrade user_data root (anything containing `user_data.json`
+        or `strategies/` with a sibling `notebooks/` is the standard
+        layout). Persisting there keeps the state out of the M3 backend's
+        strategy-copy path (STRATEGY_FILES only copies the strategy
+        source files), and survives rematerialize() because
+        user_data/ is never overwritten by grid/dev.
+
+        Falls back to:
+          1. config['user_data_dir'] (some forks inject it)
+          2. the strategy file's own directory (last resort)
+        """
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            cur = here
+            for _ in range(6):  # walk up to 6 levels
+                if os.path.isdir(cur) and (
+                    os.path.isfile(os.path.join(cur, "user_data.json"))
+                    or (os.path.isdir(os.path.join(cur, "strategies"))
+                        and os.path.isdir(os.path.join(cur, "notebooks")))
+                ):
+                    return os.path.join(cur, "grid_state.json")
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+        except Exception:
+            pass
         ud = (self.config or {}).get("user_data_dir")
-        if not ud:
+        if ud:
+            return os.path.join(ud, "grid_state.json")
+        try:
+            return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "grid_state.json")
+        except Exception:
             return None
-        return os.path.join(ud, "grid_state.json")
 
     def _save_grid_state(self):
         if not self._persist_enabled():

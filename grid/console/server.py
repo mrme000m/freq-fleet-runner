@@ -2003,11 +2003,43 @@ def _iso_db_utc(raw) -> str | None:
     return str(raw).replace(" ", "T") + "Z"
 
 
-def _engine_rest(entry: dict, path: str, timeout: float = 2.5):
+# ── engine-REST cache + back-off ───────────────────────────────────────
+# The Fleet view polls /api/overview every ~5s; without caching that is
+# 12 engine-REST calls (status/balance/pair_candles × 4 slots) every 5s.
+# Worse: a wedged engine (Hyperliquid 429 storm) holds each server-side
+# handler ~10-50s — far longer than our 2.5s client timeout — and every
+# handler holds a scoped-session DB connection. Re-polling every 5s
+# spawned zombie handlers that piled up until freqtrade's QueuePool
+# (5 + 10 overflow) exhausted and the bot loop's own read hit the 30s
+# checkout timeout (fatal crash, verified 2026-09-15). Two defenses:
+#   TTL cache   30s per (bot_code, path) — a 1h-candle grid fleet does
+#               not need fresher marks than that.
+#   cool-down   60s per instance after ANY REST failure — stop feeding
+#               the pileup while the engine recovers; SQLite-derived
+#               stats keep flowing during the back-off.
+_REST_TTL_S = 30.0
+_REST_COOLDOWN_S = 60.0
+_REST_CACHE: dict = {}       # (bot_code, path) -> (expires_at, payload)
+_REST_COOLDOWN: dict = {}    # bot_code -> expires_at (skip REST until)
+
+
+def _engine_rest(entry: dict, path: str, timeout: float = 2.5,
+                 ttl: float = _REST_TTL_S):
     """GET one freqtrade REST endpoint using the instance's api_server
     credentials (HTTP Basic). Returns parsed JSON, or None on any failure.
     Credentials are used for the Authorization header only — never logged,
-    never returned in any payload."""
+    never returned in any payload. Cached `ttl` seconds per instance+path;
+    after a failure the instance's REST calls back off for
+    _REST_COOLDOWN_S (see module note for the pool-exhaustion mechanism)."""
+    bot = str(entry.get("bot_code") or entry.get("port") or "?")
+    now = time.time()
+    cd = _REST_COOLDOWN.get(bot)
+    if cd and cd > now:
+        return None
+    key = (bot, path)
+    hit = _REST_CACHE.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
     try:
         req = urllib.request.Request(
             f"http://127.0.0.1:{int(entry['port'])}{path}")
@@ -2015,9 +2047,13 @@ def _engine_rest(entry: dict, path: str, timeout: float = 2.5):
             f"{entry['username']}:{entry['password']}".encode()).decode()
         req.add_header("Authorization", f"Basic {token}")
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read() or b"{}")
+            payload = json.loads(r.read() or b"{}")
     except Exception:
+        _REST_COOLDOWN[bot] = now + _REST_COOLDOWN_S
+        _REST_CACHE.pop(key, None)
         return None
+    _REST_CACHE[key] = (now + ttl, payload)
+    return payload
 
 
 def _engine_instance_stats(entry: dict) -> dict:
@@ -2065,6 +2101,10 @@ def _engine_instance_stats(entry: dict) -> dict:
         except Exception:
             pass
     if entry.get("username") and entry.get("password") and entry.get("port"):
+        # honest about why live marks are stale: a wedged engine (429
+        # storm / warm-up) is in REST back-off, not "down"
+        cd = _REST_COOLDOWN.get(str(entry.get("bot_code")))
+        out["api_backoff"] = bool(cd and cd > time.time())
         status = _engine_rest(entry, "/api/v1/status")
         out["api_ok"] = status is not None
         if isinstance(status, list) and status:

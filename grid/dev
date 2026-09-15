@@ -15,7 +15,8 @@ Usage:
   grid/dev open                      open the console #fleet page in a browser
   grid/dev ledger                    reliability-ledger summary (M4)
   grid/dev ledger-sync               ingest every instance's live tradesv3.sqlite
-                                     into the ledger + archive (M4 cron seam)
+                                     (or .dryrun.sqlite) into the ledger + archive
+                                     (M4 cron seam)
   grid/dev screen [--top N]          rank Hyperliquid USDC perps by ATR%×volume
   grid/dev rotate [--top N] [--llm] [--yes]
                                      swap weak slots onto top-ranked pairs;
@@ -105,8 +106,11 @@ DRY_RUN_WALLET = 150.0                           # per slot — 4 × 150 = 600
 MAX_OPEN_TRADES = 1
 # Hyperliquid public API throttle: each instance's ccxt rateLimit in ms, so
 # the 4-slot fleet stays under the shared 429 budget (producer/consumer is
-# the real fix, this is the cheap mitigation)
-CCXT_RATE_LIMIT_MS = 500
+# the real fix, this is the cheap mitigation). 1000 ms × 4 slots × 4 calls
+# per candle ≈ 16 req / candle — well under the HL free tier; the previous
+# 500 ms × 4 × 4 = 32 req / candle caused connection-pool exhaustion
+# (sqlalchemy QueuePool 5+10 hit) and wedged the engines.
+CCXT_RATE_LIMIT_MS = 1000
 # ladder archetype for the standalone long-grid fleet (canonical M4 label)
 LADDER_ARCHETYPE = "Long Grid / classic LONG"
 SLOTS_OVERRIDE = STATE / "slots.json"            # `rotate` writes pair swaps here
@@ -442,8 +446,13 @@ def engine_start():
               f"Hyperliquid)")
         spawned.append((bot_code, bot_dir, proc, port))
         # stagger spawns so the 4-slot fleet doesn't burst the shared
-        # Hyperliquid rate budget at startup (see CCXT_RATE_LIMIT_MS)
-        time.sleep(2)
+        # Hyperliquid rate budget at startup (see CCXT_RATE_LIMIT_MS).
+        # 10 s × 4 instances = 40 s total startup ramp; gives each
+        # engine time to finish its first get_tickers() + OHLCV warm
+        # before the next instance joins. Without this the public
+        # HL /info endpoint returns 429 for the whole fleet and the
+        # engines wedge on the connection pool.
+        time.sleep(10)
     if not spawned:
         return
     # wait for every spawned engine's /ping in parallel — Hyperliquid
@@ -679,10 +688,17 @@ def _tail(path, n=20):
 
 
 def _tier(stats):
+    """Display-only tier label — mirrors grid.reliability.ledger ladder
+    constants (KILL_MIN_SAMPLES=10, LADDER_FULL_MIN_SAMPLES=30,
+    LADDER_FULL_MIN_PF=1.3) so the displayed tier matches the gating
+    logic in refuse_new_archetype / size_multiplier. With < KILL_MIN_SAMPLES
+    a low recent_pf is noise, not a kill — we report 'base' there."""
     samples = stats.get("samples") or 0
     pf = stats.get("profit_factor") or 0.0
     recent = stats.get("recent_pf") or 0.0
-    if samples and recent < 1.0:
+    # Kill gate: measured AND recently unprofitable. require>=10 samples
+    # so a fresh archetype can't ban itself out of the sampling loop.
+    if samples >= 10 and recent < 1.0:
         return "KILLED"
     if samples >= 30 and pf >= 1.3:
         return "full"
@@ -1057,16 +1073,28 @@ def cmd_evaluate(args):
     }, indent=2))
 
 
+def _instance_db(bot_code: str) -> "Path | None":
+    """Locate the per-instance SQLite ledger. freqtrade dry-run writes to
+    tradesv3.dryrun.sqlite; live (future) writes to tradesv3.sqlite. We
+    accept either so the seam works against both."""
+    bot_dir = FLEET / bot_code
+    for name in ("tradesv3.sqlite", "tradesv3.dryrun.sqlite"):
+        p = bot_dir / name
+        if p.is_file():
+            return p
+    return None
+
+
 def cmd_ledger_sync():
-    """Ingest every instance's live tradesv3.sqlite into the M4 reliability
-    ledger and archive it (the cron seam that feeds the ladder + kill gate
-    that engine_config reads via _ladder_pct)."""
+    """Ingest every instance's live tradesv3(.dryrun).sqlite into the M4
+    reliability ledger and archive it (the cron seam that feeds the
+    ladder + kill gate that engine_config reads via _ladder_pct)."""
     sys.path.insert(0, str(WS))
     from grid.reliability import ledger as m4
     argv = []
     for bot_code in effective_slots():
-        db = FLEET / bot_code / "tradesv3.sqlite"
-        if db.is_file():
+        db = _instance_db(bot_code)
+        if db is not None:
             argv += ["--sqlite", f"{db}={LADDER_ARCHETYPE}"]
     if not argv:
         print("no tradesv3.sqlite found — run: grid/dev start first")
@@ -1121,7 +1149,7 @@ def main(argv):
         print("refresh: python3 -m grid.reliability.ledger "
               "--sqlite <db>=<archetype> --report   (M4 CLI)")
         print("live fleet: grid/dev ledger-sync   (ingest every instance's "
-              "tradesv3.sqlite)")
+              "tradesv3.dryrun.sqlite)")
     elif cmd == "ledger-sync":
         cmd_ledger_sync()
     elif cmd == "screen":
