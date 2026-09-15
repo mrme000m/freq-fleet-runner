@@ -35,7 +35,7 @@ What this manages (the standalone runtime):
   console   grid/console/server.py on 127.0.0.1:8798 — the mission console
             (state: grid/state/, engine banner from state/engine.json)
   engine    the dry-run freqtrade fleet — 4 slots × 150 USDC on Hyperliquid
-            USDC perps (BTC / ETH / SOL / HYPE, 1h, GridStrategy; pairs
+            USDC perps (BTC / ETH / SOL / HYPE, 1m/3m/3m/5m per-slot, GridStrategy; pairs
             verified active in ccxt). Params band_atr 4.2 / step_factor 1.0
             (taker-viable baseline — M2's 0.21 was maker-modeled and must be
             re-hyperopted). alloc scales by the M4 reliability ladder
@@ -92,12 +92,24 @@ ENGINE_BASE_PORT = 8191                           # M3's backend allocates
                                                   # concurrent M3 smoke can
                                                   # never collide with ours
 # the standalone fleet: 4 slots × 150 USDC, one Hyperliquid USDC perp per
-# slot (all verified active in ccxt before being listed here)
+# slot (all verified active in ccxt before being listed here).
+# 2026-09-15 reset: slots run in the 1-5m band per user directive —
+# each slot is pinned to its own TF so a) every candle decisions are
+# fast, b) the LLM screen/swarm has richer lower-TF context than the
+# prior 1h setup could give, c) any one slot's noise is independent.
 SLOTS = {
     "ft-btc":  ("BTC/USDC:USDC",  "BTCUSDC"),
     "ft-eth":  ("ETH/USDC:USDC",  "ETHUSDC"),
     "ft-sol":  ("SOL/USDC:USDC",  "SOLUSDC"),
     "ft-hype": ("HYPE/USDC:USDC", "HYPEUSDC"),
+}
+# Slot → timeframe. 1m-5m band (post-2026-09-15 reset). The TF is
+# stamped into the instance config and overrides GridStrategy's default.
+SLOT_TIMEFRAMES = {
+    "ft-btc":  "1m",   # most liquid, fastest cycle
+    "ft-eth":  "3m",
+    "ft-sol":  "3m",
+    "ft-hype": "5m",   # thinner book, slower to settle
 }
 DRY_RUN_WALLET = 150.0                           # per slot — 4 × 150 = 600
 
@@ -270,11 +282,15 @@ def _arg_int(args, flag, default):
 
 # ── engine (dry-run freqtrade instance) ─────────────────────────────────
 
-def engine_config(port, username, password, pair, pair_code, ladder_pct=None):
+def engine_config(port, username, password, pair, pair_code,
+                  ladder_pct=None, timeframe=None):
     """The instance config — mirrors the verified ft_user_data/config.json
     (hyperliquid futures/isolated dry-run, backtested M1/M2 shape) plus the
     api_server + initial_state the M3 backend adds per instance. `ladder_pct`
-    (M4 reliability ladder) scales the strategy's alloc; None → compute here."""
+    (M4 reliability ladder) scales the strategy's alloc; None → compute here.
+    `timeframe` defaults to the slot's pinned TF (SLOT_TIMEFRAMES) but can be
+    overridden — backtests/hyperopt pass it through explicitly."""
+    bot_tf = timeframe or "1m"  # overwritten by materialize() w/ slot TF
     return {
         "exchange": {
             "name": "hyperliquid", "key": "", "secret": "",
@@ -288,7 +304,7 @@ def engine_config(port, username, password, pair, pair_code, ladder_pct=None):
         "dry_run_wallet": DRY_RUN_WALLET,
         "stake_currency": "USDC",
         "stake_amount": "unlimited",
-        "timeframe": "1h",
+        "timeframe": bot_tf,
         "ladder_pct": ladder_pct if ladder_pct is not None else _ladder_pct(),
         "max_open_trades": MAX_OPEN_TRADES,
         "entry_pricing": {"price_side": "same", "use_order_book": True,
@@ -342,9 +358,10 @@ def materialize(bot_code):
     (bot_dir / "strategies").mkdir(exist_ok=True)
     for fn in STRATEGY_FILES:
         shutil.copy2(STRATEGY_SRC / fn, bot_dir / "strategies" / fn)
+    tf = SLOT_TIMEFRAMES.get(bot_code, "1m")
     with open(bot_dir / "config.json", "w") as f:
         json.dump(engine_config(port, username, password, pair, pair_code,
-                                ladder_pct=ladder), f, indent=2)
+                                ladder_pct=ladder, timeframe=tf), f, indent=2)
 
     entry = {
         "bot_code": bot_code,
@@ -358,6 +375,7 @@ def materialize(bot_code):
         "venue": "hyperliquid",
         "exchange_code": "HYPERLIQUID_SWAP",
         "grid_type": "long",
+        "timeframe": tf,           # 2026-09-15 reset: per-slot 1-5m TF
         "slot_balance": DRY_RUN_WALLET,
         "ladder_pct": ladder,
         "ladder_tier": tier,
@@ -442,8 +460,8 @@ def engine_start():
             reg["instances"][bot_code]["status"] = "starting"
             save_registry(reg)
         print(f"engine {bot_code} starting (pid {proc.pid}, port {port}, "
-              f"{entry['pair']} 1h DRY-RUN · wallet {DRY_RUN_WALLET}, "
-              f"Hyperliquid)")
+              f"{entry['pair']} {SLOT_TIMEFRAMES.get(bot_code, '1m')} DRY-RUN · "
+              f"wallet {DRY_RUN_WALLET}, Hyperliquid)")
         spawned.append((bot_code, bot_dir, proc, port))
         # stagger spawns so the 4-slot fleet doesn't burst the shared
         # Hyperliquid rate budget at startup (see CCXT_RATE_LIMIT_MS).
@@ -763,13 +781,15 @@ def cmd_status():
         if running:
             ping = _http_ok(
                 f"http://127.0.0.1:{entry.get('port')}/api/v1/ping", 2)
+            tf = entry.get("timeframe") or SLOT_TIMEFRAMES.get(bot_code, "1m")
             print(f"engine {bot_code:9s}: RUNNING (pid {pid}, port "
                   f"{entry.get('port')}, API {'ok' if ping else 'unreachable'}) · "
-                  f"{entry.get('pair')} 1h DRY-RUN · "
+                  f"{entry.get('pair')} {tf} DRY-RUN · "
                   f"{entry.get('slot_balance')} USDC slot")
         elif entry:
+            tf = entry.get("timeframe") or SLOT_TIMEFRAMES.get(bot_code, "1m")
             print(f"engine {bot_code:9s}: stopped (port {entry.get('port')}) · "
-                  f"{entry.get('pair')} 1h dry-run — start: "
+                  f"{entry.get('pair')} {tf} dry-run — start: "
                   f"{Path(__file__).name} start")
         else:
             print(f"engine {bot_code:9s}: not created — "
@@ -1019,6 +1039,17 @@ def _swarm_ticket(screen_row, current_pair=""):
                  "max_commitment": DRY_RUN_WALLET * 0.5,
                  "current_pair": current_pair},
     }
+    try:
+        # 2026-09-15 reset: every swarm decision is grounded in the
+        # lower-TF band the engines now trade on. attach_multi_tf fetches
+        # 1m + 5m + 15m candles from Hyperliquid and threads the summary
+        # into brief['market_context'] so every agent sees the same
+        # structure + execution view. Best-effort: HL outage still
+        # returns a metrics-only brief.
+        from grid.agents import attach_multi_tf as _attach_mtf
+        brief = _attach_mtf(brief, coin=coin)
+    except Exception:
+        pass
     try:
         return _deliberate(brief)
     except Exception as exc:

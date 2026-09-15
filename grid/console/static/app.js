@@ -375,7 +375,7 @@ const CHART_TTL_MS = 5 * 60 * 1000;
 const chartInflight = {};   // same key -> promise, dedupes parallel polls
 let slotChartsBusy = false;
 
-async function fetchChart(venue, symbol, interval = "1h", bars = 96) {
+async function fetchChart(venue, symbol, interval = "5m", bars = 96) {
   const key = `${venue}:${symbol}:${interval}`;
   const hit = chartCache[key];
   if (hit && Date.now() - hit.at < CHART_TTL_MS) return hit.data;
@@ -575,12 +575,12 @@ function openMarketModal(key, slot) {
   if (cachedBars.length >= 2) {
     paint(cachedBars);
   } else {
-    chartHost.innerHTML = `<div class="mk-empty"><span class="spinner"></span> fetching ${esc(venue)}:${esc(symbol)} 1h bars…</div>`;
+    chartHost.innerHTML = `<div class="mk-empty"><span class="spinner"></span> fetching ${esc(venue)}:${esc(symbol)} 5m bars…</div>`;
     // Fire (or wait on an in-flight) fetch with a bounded timeout — never
     // strand the operator on a spinner if tvcli is down.
     let timer;
     const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("timeout")), 12000); });
-    const work = fetchChart(venue, symbol, "1h", 96)
+    const work = fetchChart(venue, symbol, "5m", 96)
       .then((d) => (d && d.bars) || [])
       .catch(() => null);
     Promise.race([work, timeout]).then((bars) => {

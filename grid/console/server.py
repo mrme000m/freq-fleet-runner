@@ -592,7 +592,12 @@ def pnl_payload() -> dict:
 # Base URL of the tvcli serve daemon; read at import like PB_URL, and
 # referenced through the module global so tests can point it at a stub.
 TVCLI_BASE = os.environ.get("TVCLI_SERVER", "http://127.0.0.1:8765")
-CHART_INTERVALS = ("15m", "1h", "4h", "1d")
+# CHART_INTERVALS — the dropdown set the mission console exposes to the
+# frontend chart picker. Post-2026-09-15 reset: every slot runs in the
+# 1m-5m band, so the lower-TF intervals are surfaced first and the
+# 15m stays as the swing anchor the swarm uses as its highest-TF
+# context bar. 1h / 4h / 1d remain available for context comparison.
+CHART_INTERVALS = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
 CHART_TTL = 60.0            # seconds a fetched window stays fresh
 CHART_CACHE_MAX = 32        # bounded in-process cache (keys are 4-tuples)
 
@@ -2157,10 +2162,15 @@ def _live_geometry(entry: dict) -> dict | None:
     params = ((tuned.get("params") or {}).get("buy") or {})
     band_atr = float(params.get("band_atr") or 3.0)
     step_factor = float(params.get("step_factor") or 0.5)
+    # 2026-09-15 reset: each slot has its own TF (BTC=1m, ETH/SOL=3m,
+    # HYPE=5m); the channel preview probes pair_candles at the slot TF
+    # so what the dashboard shows matches what the strategy actually
+    # sees. Fallback to 1m (the GridStrategy default) when unknown.
+    slot_tf = (entry.get("timeframe") or "1m")
     candles = _engine_rest(
         entry, "/api/v1/pair_candles?pair="
         + urllib.parse.quote(str(entry.get("pair") or ""), safe="")
-        + "&timeframe=1h&limit=1")
+        + f"&timeframe={slot_tf}&limit=1")
     if isinstance(candles, dict):
         cols = candles.get("columns") or []
         rows = candles.get("data") or []
@@ -2935,7 +2945,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, pnl_payload())
         elif route == "/api/chart":
             code, payload = _chart_bars(q1("venue", ""), q1("symbol", ""),
-                                        q1("interval", "1h"),
+                                        q1("interval", "5m"),
                                         q1("bars", "96"))
             self._json(code, payload)
         elif route == "/api/position-sweeps":

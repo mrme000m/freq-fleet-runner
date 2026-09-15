@@ -69,12 +69,44 @@ from freqtrade.strategy import DecimalParameter, IStrategy
 import talib.abstract as ta
 
 
+# --- timeframe helpers (1m-5m band) -------------------------------------
+
+# Map freqtrade timeframe strings to (unit, count) so a candle-count
+# cooldown converts to the right wall-clock duration regardless of the
+# slot's TF. The 1-5m band is fixed; if a slot is ever bumped back to
+# 15m+ this still works (the table covers freqtrade's full set).
+_TF_UNIT = {
+    "1m": ("m", 1), "3m": ("m", 3), "5m": ("m", 5), "15m": ("m", 15),
+    "30m": ("m", 30), "1h": ("h", 1), "4h": ("h", 4), "1d": ("d", 1),
+}
+
+
+def _tf_timedelta(tf: str, n: int):
+    """N candles of TF `tf` as a timedelta — unit-aware (1m=1min,
+    5m=5min, 1h=1h). Unknown TFs fall back to minutes."""
+    unit, mult = _TF_UNIT.get(tf, ("m", 1))
+    if unit == "m":
+        return timedelta(minutes=n * mult)
+    if unit == "h":
+        return timedelta(hours=n * mult)
+    if unit == "d":
+        return timedelta(days=n * mult)
+    return timedelta(minutes=n * mult)
+
+
 class GridStrategy(IStrategy):
     INTERFACE_VERSION = 3
 
-    timeframe = "1h"
-    startup_candle_count = 30
-    process_only_new_candles = True
+    # Default slot TF is 1m (lower-TF band 1m-5m per the 2026-09-15 reset).
+    # Per-slot TF is overridden by the deployer's `timeframe` config key
+    # (grid/dev pins BTC=1m, ETH=3m, SOL=3m, HYPE=5m), so this default
+    # only matters for backtests / hyperopt / smoke runs.
+    timeframe = "1m"
+    # ATR(14) + EMA(26) need >=30 bars; 60 keeps the EMA warm on 1m and
+    # is cheap on 5m. Same number across the 1-5m band — only the wall-
+    # clock time scales (60m @ 1m TF, 5h @ 5m TF).
+    startup_candle_count = 60
+    process_only_new_candles = False
     can_short = False
 
     # --- geometry knobs (hyperoptable, space=buy) ---
@@ -111,7 +143,10 @@ class GridStrategy(IStrategy):
     step_min = 0.1  # grid_defaults parity (fee_floor_step defaults)
     step_max = 2.0
     max_refills_per_line = 2  # bounded re-buys of a sold line per trade
-    # candles (1h) to wait before re-entering after a channel-bottom exit
+    # candles to wait before re-entering after a channel-bottom exit.
+    # Counted in the slot's own timeframe (1m / 3m / 5m), not in hours —
+    # the prior `timedelta(hours=...)` made the cooldown wrong by 60-300x
+    # on the lower-TF band.
     recenter_cooldown_candles = 6
 
     minimal_roi = {"0": 100}
@@ -445,8 +480,9 @@ class GridStrategy(IStrategy):
         # cut the position and block re-entry for a cooldown.
         bottom_break = state["lines"][0] * (1 - state["step_pct"] / 2 / 100.0)
         if current_rate < bottom_break:
-            self._recenter_block_until[pair] = current_time + timedelta(
-                hours=self.recenter_cooldown_candles)
+            self._recenter_block_until[pair] = current_time + \
+                _tf_timedelta(self.timeframe,
+                              self.recenter_cooldown_candles)
             return "channel_bottom_exit"
         return None
 

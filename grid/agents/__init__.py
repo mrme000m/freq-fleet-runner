@@ -25,5 +25,5 @@ from .llm import (  # noqa: F401
 )
 from .deliber import (  # noqa: F401
     deliberate, brief_text, bull_open, bear_open, rebuttal, facilitator,
-    risk_review, swarm_ticket, GRID_TYPE,
+    risk_review, swarm_ticket, attach_multi_tf, GRID_TYPE,
 )

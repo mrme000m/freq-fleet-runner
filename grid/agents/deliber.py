@@ -31,6 +31,16 @@ if str(HERE.parent) not in sys.path:  # so `grid.agents.llm` resolves
 
 from grid.agents.llm import chat_json  # noqa: E402
 
+# Lower-TF analysis base: every swarm decision grounds itself in the
+# Multi-TF pack (1m + 5m + 15m) so the LLM sees structure + execution,
+# not just a single bar. The pack is built once per candidate and
+# threaded through bull/bear/facilitator/risk prompts via
+# brief["market_context"] — single source of truth, no per-agent drift.
+try:
+    from grid.screen import multi_tf_pack  # noqa: E402
+except Exception:  # pragma: no cover — fallback path for unit tests
+    multi_tf_pack = None
+
 GRID_TYPE = {
     "chop_high_volatility": "neutral",
     "squeeze": "neutral",
@@ -124,6 +134,64 @@ def brief_text(brief):
         obj["market_context"] = market_context
     return json.dumps(obj)
 
+
+# --- Multi-TF analysis pack ---------------------------------------------
+
+def _summarize_pack(pack):
+    """Compress a Multi-TF pack into a prompt-friendly summary.
+
+    Drops the raw OHLC points (LLMs reason better over trend slopes
+    + regime tags than over 60 number tuples) and computes a per-TF
+    trend slope so every agent sees the same lower-TF context."""
+    if not pack or not isinstance(pack, dict):
+        return None
+    tfs = pack.get("tfs") or {}
+    out = {"coin": pack.get("coin"), "atr_pct_aggregate": pack.get("atr_pct"),
+           "tfs": {}}
+    for tf, blob in tfs.items():
+        pts = blob.get("points") or []
+        if len(pts) >= 2:
+            first, last = pts[0][4], pts[-1][4]
+            slope = ((last - first) / first * 100.0) if first else 0.0
+        else:
+            slope = 0.0
+        out["tfs"][tf] = {
+            "close": blob.get("close"),
+            "atr_pct": blob.get("atr_pct"),
+            "trend_pct": round(slope, 3),
+            "n_bars": len(pts),
+        }
+    return out
+
+
+def attach_multi_tf(brief, coin=None, tfs=None):
+    """Attach a Multi-TF analysis pack to `brief` in-place.
+
+    The pack is the SINGLE source of candle truth for every swarm
+    agent — the 1m + 5m + 15m bar sets the LLM's view of structure,
+    regime, and execution micro-structure. Without it the swarm was
+    blind to the lower-TF band the engines now trade on.
+
+    Returns the (possibly mutated) brief. If the pack can't be fetched
+    (HL outage, offline), `brief` is returned unchanged — the swarm
+    then runs on the legacy metrics-only path, same as before the
+    lower-TF reset."""
+    if multi_tf_pack is None:
+        return brief
+    target = coin or brief.get("symbol") or brief.get("pair_code")
+    if not target:
+        return brief
+    try:
+        pack = multi_tf_pack(target, tfs=tfs)
+        brief["market_context"] = _summarize_pack(pack)
+        brief["market_context_full"] = pack  # full pack for the rotator
+    except Exception:
+        # Best-effort: swarm still has metrics; degrade gracefully.
+        pass
+    return brief
+
+
+# --- per-agent deliberation ---------------------------------------------
 
 def bull_open(brief, _chain=None):
     fb = {"side": "long" if brief.get("regime") != "trend_down" else "short",
