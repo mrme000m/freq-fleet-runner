@@ -110,6 +110,65 @@ def test_tf_minutes(gs):
     assert gs._tf_minutes("4h") == 240.0
 
 
+# --- trend-horizon rescaling ----------------------------------------------
+
+def test_trend_ema_period_renormalizes_horizon(gs):
+    """The tuned gate is EMA26 on 1h == a ~26h trend. Every slot TF must
+    measure the SAME horizon in bars of its own size; 1h stays bit-equal
+    (exactly 26) and the 1m-5m band scales up (1560 / 520 / 312)."""
+    assert gs._trend_ema_period("1h") == 26
+    assert gs._trend_ema_period("1m") == 1560
+    assert gs._trend_ema_period("3m") == 520
+    assert gs._trend_ema_period("5m") == 312
+    assert gs._trend_ema_period("15m") == 104
+
+
+def test_startup_candle_count_covers_trend_horizon(gs):
+    """The EMA must be warm: startup covers the rescaled period (+40),
+    so a 1m slot fetches ~1600 bars (~27h) and a 1h slot stays lean."""
+    assert gs.GridStrategy({"timeframe": "1m"}).startup_candle_count == 1600
+    assert gs.GridStrategy({"timeframe": "3m"}).startup_candle_count == 560
+    assert gs.GridStrategy({"timeframe": "5m"}).startup_candle_count == 352
+    assert gs.GridStrategy({"timeframe": "1h"}).startup_candle_count == 70
+
+
+def test_entry_blocked_in_multiday_downtrend_despite_micro_bounce(gs):
+    """THE HYPE regression (2026-09-15): price sat ~at the 26-bar micro
+    EMA (130min on 5m) while >0.5% under the 26h trend — the pre-fix
+    gate waved entries into a falling tape all session. With the
+    rescaled horizon the same wall-clock tape is blocked on 5m AND on
+    1h (the calibrated regime), by the TREND gate — vol clears on both.
+    """
+    # same wall-clock shape at both TFs: ~21h flat at 100, drop to 97,
+    # ~8h flat. 5m: 252+96 bars; 1h: 21+8 bars.
+    tapes = {"5m": [100.0] * 252 + [97.0] * 96,
+             "1h": [100.0] * 21 + [97.0] * 8}
+    for tf, closes in tapes.items():
+        df = pd.DataFrame({
+            "open": closes,
+            "high": [c * 1.002 for c in closes],   # raw ATR% ~0.4%/bar:
+            "low": [c * 0.998 for c in closes],    #   5m -> 1.39%, 1h -> 0.4%
+            "close": closes, "volume": [10.0] * len(closes),
+        })
+        s = _strategy_at_tf(gs, tf)
+        out = s.populate_indicators(df.copy(), None)
+        # premise: vol gate passes (so the TREND gate is the blocker)
+        last = out.iloc[-1]
+        assert last["atr_pct"] >= s._entry_gate_atr(), tf
+        if tf == "5m":
+            # the pre-fix 26-bar EMA converges inside the 8h flat tail —
+            # the old gate would have ENTERED here (the regression)
+            micro = df["close"].ewm(span=26, adjust=False).mean().iloc[-1]
+            assert df["close"].iloc[-1] >= micro * (1 - 0.5 / 100), tf
+        out = s.populate_entry_trend(out, None)
+        # the flat-at-100 segment legitimately enters; what must stay
+        # blocked is every bar AFTER the drop into the downtrend
+        n_flat_tail = 8 if tf == "1h" else 96
+        tail = out["enter_long"].iloc[-n_flat_tail:]
+        assert int((tail == 1).sum()) == 0, (
+            f"{tf}: entries must stay blocked under the 26h trend")
+
+
 def test_entry_gate_atr_default_params(gs):
     """With the shipped defaults the effective gate is the fee-clearance
     bar 1.5 x (2x0.02 spread + 0.20 taker round trip) = 0.36% — the

@@ -601,15 +601,25 @@ def pnl_payload() -> dict:
             fleet_unrealized += stats["open_profit_abs"] or 0.0
             has_live_mark = True
     events.sort(key=lambda e: e[0] or "")
+    # Cumulative realized must sum EVERY closed trade ever, not just the
+    # ones we keep for the sparkline: the old `events[-199:]` slice was
+    # applied BEFORE the running sum, so the fleet's headline cumulative
+    # PnL silently reset to (last 199 trades) once history passed 199
+    # rows — understating profit by everything older. Sum all, then
+    # truncate only the emitted POINTS (seeded with the carried total so
+    # the visible curve stays continuous and ends at the true number).
+    realized = sum(float(p or 0.0) for _at, p, _code in events)
+    keep = 199
+    head = events[:-keep] if len(events) > keep else []
+    running = sum(float(p or 0.0) for _at, p, _code in head)
     points = []
-    realized = 0.0
-    for at, profit, code in events[-199:]:
-        realized += profit
+    for at, profit, code in events[len(head):]:
+        running += float(profit or 0.0)
         points.append({
             "at": _iso_db_utc(at), "bot_code": code,
-            "fleet": {"realized": round(realized, 6),
+            "fleet": {"realized": round(running, 6),
                       "unrealized": 0.0,
-                      "net": round(realized, 6)}})
+                      "net": round(running, 6)}})
     if has_live_mark:
         realized_live = realized + fleet_open_realized
         points.append({
@@ -929,8 +939,13 @@ def _pid_alive(pid: int) -> bool:
 def _tier(stats: dict) -> str:
     samples = stats.get("samples") or 0
     pf = stats.get("profit_factor") or 0.0
-    recent = stats.get("recent_pf") or 0.0
-    if samples and recent < LADDER["pf_kill"]:
+    recent = stats.get("recent_pf")
+    # A missing/undefined recent_pf must NOT read as 0.0: an archetype
+    # that has never had a losing trip has no recent-loss denominator,
+    # and `or 0.0` displayed it as KILLED while the money path (ledger
+    # .refuse_new_archetype, which requires recent_pf is not None) kept
+    # it alive. Mirror the gate exactly: no recent_pf → no kill signal.
+    if samples and recent is not None and float(recent) < LADDER["pf_kill"]:
         return "killed"
     if samples >= LADDER["full_samples"] and pf >= LADDER["pf_pass"]:
         return "full"
@@ -1652,8 +1667,8 @@ def logs_payload(lines: int, grep: str | None) -> dict:
     if log.get("source") == "workspace-tail":
         rows = (log.get("lines_text") or "").splitlines()
         if grep:
-            pat = re.compile(grep, re.IGNORECASE)
-            rows = [r for r in rows if pat.search(r)]
+            needle = grep.lower()   # literal, not a regex — see below
+            rows = [r for r in rows if needle in r.lower()]
         return {
             "lines": rows[-max(1, min(lines, 4000)):],
             "total": len(rows),
@@ -1665,8 +1680,12 @@ def logs_payload(lines: int, grep: str | None) -> dict:
     text = _tail(log["path"], 1024 * 1024)
     rows = text.splitlines()
     if grep:
-        pat = re.compile(grep, re.IGNORECASE)
-        rows = [r for r in rows if pat.search(r)]
+        # Treat the filter as a LITERAL, never as a regex: `?grep=` is
+        # user input compiled straight into a pattern, so `(a+)+$` would
+        # pin the handler thread indefinitely (catastrophic backtracking)
+        # on a threaded server with no request timeout.
+        needle = grep.lower()
+        rows = [r for r in rows if needle in r.lower()]
     return {"lines": rows[-max(1, min(lines, 2000)):], "total": len(rows),
             "path": log["path"], "source": log["source"]}
 
@@ -2152,6 +2171,122 @@ def _engine_rest(entry: dict, path: str, timeout: float = 2.5,
     return payload
 
 
+_GRID_TAG_RE = re.compile(r"grid_(buy|sell)_L(\d+)$")
+
+
+def _grid_harvest(cur, inst_dir: str | None) -> dict:
+    """Per-line round-trip harvest: realized cash from COMPLETED grid
+    line trips (grid_buy_Li fill paired FIFO with the next grid_sell_Li
+    fill on the same line), net of the instance's config fee on both
+    legs.
+
+    This is the grid's true engine output, and it deliberately works on
+    OPEN trades: freqtrade books partial-exit profit against the
+    position's AVERAGE cost (realized_profit), so a fee-positive line
+    trip mid-trade reads as a loss whenever earlier rungs were bought
+    higher (SOL showed realized -0.13 on 2026-09-15 while its two line
+    trips were net-positive). Completed per-line trips are realized
+    cash regardless of the trade's open state; unrealized inventory
+    marks stay in open_profit_abs where they belong.
+    """
+    out = {"grid_harvest": 0.0, "grid_harvest_24h": 0.0,
+           "grid_trips": 0, "grid_trips_24h": 0}
+    fee = 0.001
+    try:
+        cfg = _read_json(os.path.join(inst_dir or "", "config.json"), {})
+        fee = float(cfg.get("fee") or fee)
+    except Exception:
+        pass
+    try:
+        rows = cur.execute(
+            "SELECT ft_order_tag, ft_order_side, "
+            "coalesce(nullif(average, 0), price), filled, "
+            "order_filled_date FROM orders "
+            "WHERE status='closed' AND order_filled_date IS NOT NULL "
+            "ORDER BY order_filled_date, id").fetchall()
+    except Exception:
+        return out
+    lots: dict = {}  # line -> FIFO of [qty, price]
+    cutoff = time.time() - 86400
+    for tag, side, px, qty, filled_at in rows:
+        m = _GRID_TAG_RE.match(tag or "")
+        if not m or not px or not qty:
+            continue
+        line = int(m.group(2))
+        if m.group(1) == "buy":
+            lots.setdefault(line, []).append([float(qty), float(px)])
+            continue
+        # sell: drain the line's buy lots FIFO, one trip per matched lot
+        q = float(qty)
+        sp = float(px)
+        for lot in lots.get(line, []):
+            if q <= 1e-12:
+                break
+            take = min(q, lot[0])
+            if take > 1e-12:
+                pnl = take * (sp - lot[1]) - fee * take * (sp + lot[1])
+                out["grid_harvest"] += pnl
+                out["grid_trips"] += 1
+                ts = _iso_db_utc(filled_at)
+                if ts:
+                    try:
+                        ep = datetime.fromisoformat(
+                            ts.replace("Z", "+00:00")).timestamp()
+                        if ep >= cutoff:
+                            out["grid_harvest_24h"] += pnl
+                            out["grid_trips_24h"] += 1
+                    except (ValueError, TypeError):
+                        pass
+                lot[0] -= take
+                q -= take
+        lots[line] = [lot for lot in lots.get(line, []) if lot[0] > 1e-12]
+        # Overshoot: freqtrade rounds the sell amount to pair precision,
+        # so `q` commonly exceeds the line's remaining buy qty. The old
+        # loop discarded the surplus — booking the proceeds of quantity
+        # that was never bought as pure spread, i.e. inventing profit.
+        # Drain it against the trade's OTHER lots (the position is
+        # fungible) and, if none remain, record it as unmatched instead
+        # of silently booking it.
+        if q > 1e-9:
+            for other in lots:
+                if other == line or q <= 1e-9:
+                    continue
+                for lot in lots[other]:
+                    if q <= 1e-9:
+                        break
+                    take = min(q, lot[0])
+                    if take <= 1e-9:
+                        continue
+                    pnl = take * (sp - lot[1]) - fee * take * (sp + lot[1])
+                    out["grid_harvest"] += pnl
+                    out["grid_trips"] += 1
+                    ts = _iso_db_utc(filled_at)
+                    if ts:
+                        try:
+                            ep = datetime.fromisoformat(
+                                ts.replace("Z", "+00:00")).timestamp()
+                            if ep >= cutoff:
+                                out["grid_harvest_24h"] += pnl
+                                out["grid_trips_24h"] += 1
+                        except (ValueError, TypeError):
+                            pass
+                    lot[0] -= take
+                    q -= take
+                lots[other] = [l for l in lots[other] if l[0] > 1e-12]
+        if q > 1e-9:
+            # sold more than the whole recorded position: cannot be
+            # costed. Surface it rather than booking phantom profit.
+            out.setdefault("unmatched_sell_qty", 0.0)
+            out["unmatched_sell_qty"] = round(
+                out["unmatched_sell_qty"] + q, 12)
+            out.setdefault("surprises", []).append(
+                f"grid_sell L{line} qty {qty} exceeds every recorded buy "
+                f"lot by {q:.10f} — uncosted, excluded from harvest")
+    out["grid_harvest"] = round(out["grid_harvest"], 6)
+    out["grid_harvest_24h"] = round(out["grid_harvest_24h"], 6)
+    return out
+
+
 def _engine_instance_stats(entry: dict) -> dict:
     """Live per-instance facts: sqlite counts/realized + engine REST marks.
     Every source is a workspace artifact or the local engine itself; REST
@@ -2161,6 +2296,8 @@ def _engine_instance_stats(entry: dict) -> dict:
         "api_ok": False, "wallet_total": None,
         "open_trades": 0, "closed_trades": 0, "realized": 0.0,
         "open_stake": 0.0, "fills": 0, "fills_24h": 0,
+        "grid_harvest": 0.0, "grid_harvest_24h": 0.0,
+        "grid_trips": 0, "grid_trips_24h": 0,
         "open_profit_abs": None, "open_profit_pct": None,
         "open_enter_tag": None, "last_fill_at": None,
         "started_at": None,
@@ -2203,6 +2340,7 @@ def _engine_instance_stats(entry: dict) -> dict:
                             "AND order_filled_date > "
                             "datetime('now', '-1 day')")
                 out["fills_24h"] = int(cur.fetchone()[0] or 0)
+                out.update(_grid_harvest(cur, entry.get("dir")))
             finally:
                 con.close()
         except Exception:
@@ -2231,7 +2369,27 @@ def _engine_instance_stats(entry: dict) -> dict:
             if profits:
                 out["open_profit_abs"] = round(sum(profits), 6)
             if pcts:
-                out["open_profit_pct"] = round(sum(pcts), 4)
+                # Stake-weighted, never a plain sum: adding per-trade
+                # profit percentages across positions of different size
+                # is meaningless (two trades at +1% on $10 and $200 is
+                # not "+2%"). Derive it from profit_abs / stake_amount,
+                # which is the only correct aggregation.
+                tot = 0.0
+                for t in status:
+                    if not isinstance(t, dict):
+                        continue
+                    s = t.get("stake_amount")
+                    if isinstance(s, (int, float)) and s and \
+                            isinstance(t.get("profit_abs"), (int, float)):
+                        tot += float(s)
+                if tot > 0 and profits:
+                    out["open_profit_pct"] = round(
+                        sum(profits) / tot * 100.0, 4)
+                else:
+                    # no usable stake: fall back to the mean, which at
+                    # least stays on a comparable percentage scale
+                    out["open_profit_pct"] = round(
+                        sum(pcts) / len(pcts), 4)
             out["open_enter_tag"] = status[0].get("enter_tag")
         bal = _engine_rest(entry, "/api/v1/balance")
         if isinstance(bal, dict) and isinstance(bal.get("total"),
@@ -2941,9 +3099,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # Hard ceiling on a request body. A client-declared Content-Length is
+    # attacker-controlled: `read(-1)` blocks until connection close and a
+    # huge value buffers unbounded in memory, and this server is a
+    # ThreadingHTTPServer with no request timeout — a trivial local DoS.
+    MAX_BODY_BYTES = 1 << 20
+
     def _body(self) -> dict:
         try:
-            n = int(self.headers.get("Content-Length", 0))
+            n = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            return {}
+        if n < 0 or n > self.MAX_BODY_BYTES:
+            return {}
+        try:
             return json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return {}
@@ -2986,7 +3155,29 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     # -- routing --
+    def _guarded(self, fn):
+        """Run a verb handler with a real error boundary.
+
+        Neither do_GET nor do_POST had one: a single bad query parameter
+        (`?limit=abc` → ValueError) or any exception inside a payload
+        builder escaped as an unhandled traceback, the connection died
+        with no response at all, and the UI saw a network error instead
+        of a message. Fail as JSON, and let client disconnects go quiet.
+        """
+        try:
+            fn()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:      # noqa: BLE001 - top-level HTTP boundary
+            try:
+                self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            except Exception:
+                pass
+
     def do_GET(self):
+        self._guarded(self._get)
+
+    def _get(self):
         from urllib.parse import urlparse, parse_qs
         u = urlparse(self.path)
         q = parse_qs(u.query)
@@ -3127,6 +3318,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "unknown path"})
 
     def do_POST(self):
+        self._guarded(self._post)
+
+    def _post(self):
         from urllib.parse import urlparse
         route = urlparse(self.path).path
         if not self._same_origin():

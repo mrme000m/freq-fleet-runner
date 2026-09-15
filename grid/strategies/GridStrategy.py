@@ -18,9 +18,10 @@ M5 profitability pass (see docs/reliability-ledger.md §"Finding"):
     step to clear fees (min_atr_pct floor + min_step_multiple × cost) or
     in a confirmed downtrend (close below EMA26 by trend_tolerance_pct).
   * downside exit + recenter cooldown.
-  * bounded line refill (max_refills_per_line); every buy window (fresh
-    line and refill alike) is capped where the line's TP still clears the
-    round-trip cost, so no fill can be fee-negative churn.
+  * bounded line refill (max_refills_per_line). (The M5 "fee-viable buy
+    window" was superseded by the 2026-09-15 resting-ladder pass below:
+    fills now land AT the line, so the step >= min_step_multiple x cost
+    entry gate is itself the per-trip fee bar.)
   * confirm-then-mutate line state (2026-09-15 desync fix): `filled` /
     `refills` change ONLY in order_filled (freqtrade's fill
     confirmation) — never at adjust_trade_position decision time, where a
@@ -51,6 +52,52 @@ Dynamic TF rescaling (2026-09-15 lower-TF band, 1m-5m):
     fee-clearing steps (~0.4-0.9%) inside a sane +-1-2% channel. The
     lower-TF cadence shows up in management speed (per-candle downside
     / refill / cooldown checks), not in degenerate geometry.
+  * the trend gate's EMA horizon is rescaled the same way
+    (_trend_ema_period: 26 bars x 60/tf_minutes): the tuned gate is
+    EMA26 on 1h = a ~26h trend. A fixed 26-bar EMA on the 1m-5m band
+    spans 26-130 MINUTES — it lets slots average into a multi-day
+    downtrend whenever price bounces above the micro trend (the
+    2026-09-15 session: every slot 1.7-2.7% under its 26h EMA while
+    the micro gate waved entries through). A 1h slot stays bit-equal
+    (exactly 26 bars); startup_candle_count scales to match.
+
+Resting-ladder harvest (2026-09-15 profitability fix):
+  * grid orders are priced AT their line, not at market: a grid buy
+    rests as a limit at lines[i] (custom_entry_price parses the
+    grid_buy_Li tag), a grid sell rests at the line's TP
+    lines[j]*(1+step) (custom_exit_price parses grid_sell_Lj). Every
+    completed round trip banks the FULL step minus cost — the
+    entry gate's step >= min_step_multiple x cost guarantee is what
+    each trip actually earns.
+  * the pre-fix design market-bought inside a fee-viable WINDOW above
+    the line: in a falling tape every fill landed at the window's top
+    edge, so trips harvested ~= the cost floor (observed live: +0.25%
+    gross vs 0.24% cost — fee-positive by one bp, i.e. churn). Line
+    fills are structurally immune: the harvest is fixed at order
+    placement, not at the mercy of where inside a window the fill
+    lands.
+  * placement is clamp-safe: freqtrade's get_valid_price drags any
+    custom price beyond custom_price_max_distance_ratio (2% default)
+    of the current rate back toward market, which could reprice a TP
+    below its line's cost or a deep rung above its line. Orders are
+    therefore only placed on lines within _CUSTOM_PRICE_REACH of the
+    current rate (buys: below rate; sells: TP above rate); deeper
+    rungs enter the envelope as price descends, so the ladder slides
+    with price instead of resting the whole channel depth at once.
+  * freqtrade keeps at most ONE open order per trade on the adjust
+    path — placing an order that differs from the resting one CANCELS
+    the resting one (freqtradebot.handle_similar_open_order, REPLACE;
+    observed live 2026-09-15 as a sell/sell ping-pong on BTC). So the
+    strategy works a single desired order per loop and sticks with it
+    while it rests: sells take precedence once their line is at/above
+    the rate (harvest first), a parked sell is only swapped for a buy
+    when the rate falls below its line (falling tape — keep laddering
+    down), and a resting buy is never re-decided (re-placing it would
+    just cancel/rebook the same rung every loop).
+  * a sell vetoed by freqtrade's remaining-position minimum no longer
+    blocks the loop: adjust falls through to the buy branch so the
+    position can grow past the veto bar (the pre-fix shape deadlocked:
+    sell decided every loop -> veto -> None -> buys never re-fired).
 
 Geometry resolution chain — all locations hold the SAME module, kept
 byte-identical by grid/tests/test_vendored_sync.py:
@@ -66,6 +113,7 @@ byte-identical by grid/tests/test_vendored_sync.py:
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 
@@ -77,6 +125,7 @@ try:
         geometric_lines,
         per_line_size,
         round_trip_fee_pct,
+        side_lines_count,
     )
 except ImportError:
     sys.path.insert(0, "/Volumes/ExMac/code/tradingview/go/agents/grid-autonomy")
@@ -88,6 +137,7 @@ except ImportError:
         geometric_lines,
         per_line_size,
         round_trip_fee_pct,
+        side_lines_count,
     )
 
 from freqtrade.persistence import Trade
@@ -148,6 +198,28 @@ def _atr_scale(tf: str) -> float:
     return math.sqrt(ATR_REF_MINUTES / max(_tf_minutes(tf), 1e-9))
 
 
+# Tuned trend horizon: EMA26 on 1h candles == a ~26h trend. The gate's
+# semantics ("don't average a long grid into a multi-day downtrend") are
+# denominated in HOURS, not bars — rescale the period so every slot TF
+# measures the same horizon (1m -> 1560, 3m -> 520, 5m -> 312, 1h -> 26).
+_TREND_EMA_REF_PERIOD = 26
+
+
+def _trend_ema_period(tf: str) -> int:
+    """EMA period carrying the 1h-calibrated 26-bar trend horizon onto
+    the slot's TF. 1h -> exactly 26 (bit-equal to the tuned regime)."""
+    return max(2, round(_TREND_EMA_REF_PERIOD
+                        * ATR_REF_MINUTES / max(_tf_minutes(tf), 1e-9)))
+
+
+_GRID_BUY_TAG_RE = re.compile(r"grid_buy_L(\d+)$")
+_GRID_SELL_TAG_RE = re.compile(r"grid_sell_L(\d+)$")
+# the min-exit-veto full-position exit. Deliberately NOT matched by the
+# ledger's grid_(buy|sell)_Li regex — pairing reads it as the trade's
+# full exit, one full_exit trip per lot, no pool-drain surprise.
+_GRID_FLATTEN_TAG_RE = re.compile(r"grid_flatten_L(\d+)$")
+
+
 class GridStrategy(IStrategy):
     INTERFACE_VERSION = 3
 
@@ -156,10 +228,11 @@ class GridStrategy(IStrategy):
     # (grid/dev pins BTC=1m, ETH=3m, SOL=3m, HYPE=5m), so this default
     # only matters for backtests / hyperopt / smoke runs.
     timeframe = "1m"
-    # ATR(14) + EMA(26) need >=30 bars; 60 keeps the EMA warm on 1m and
-    # is cheap on 5m. Same number across the 1-5m band — only the wall-
-    # clock time scales (60m @ 1m TF, 5h @ 5m TF).
-    startup_candle_count = 60
+    # startup_candle_count is set per instance in __init__ from the
+    # slot's TF (the TF-rescaled trend EMA needs its full period warm:
+    # 1560+ bars on 1m, 26+40 on 1h). The class default only covers a
+    # bare EMA26 + ATR14 warm-up.
+    startup_candle_count = 70
     process_only_new_candles = False
     can_short = False
 
@@ -191,6 +264,15 @@ class GridStrategy(IStrategy):
     spread_pct = DecimalParameter(0.0, 0.10, default=0.02, decimals=2,
                                   space="buy")
 
+    # Hard ceiling on the ONE-SIDED worst-case commitment, as a multiple of
+    # the (ladder-scaled) allocation. The exchange minimum per line
+    # (`min_cost`) RUINS naive allocation: per_line_size() lifts every line
+    # to `min_cost`, so at alloc $25 (base tier) x ~4 adverse-side lines x
+    # $10 the grid silently committed $40 — 1.6x its entire budget — and
+    # every ladder tier sized identically. Capital at risk is now bounded
+    # and the tiers genuinely differ (see _armed_rungs).
+    max_commit_ratio = 1.0
+
     # --- fixed economics / structural knobs ---
     venue = "hyperliquid"
     use_taker_fee = True  # config charges taker per side; floor must match
@@ -202,6 +284,14 @@ class GridStrategy(IStrategy):
     # the prior `timedelta(hours=...)` made the cooldown wrong by 60-300x
     # on the lower-TF band.
     recenter_cooldown_candles = 6
+    # custom-price placement envelope: freqtrade's get_valid_price clamps
+    # a custom order price to within custom_price_max_distance_ratio of
+    # the current rate (2% default). Grid orders are only placed when
+    # their line price sits inside this envelope (1.9% — the default
+    # with margin), so the exchange order lands AT the line/TP instead
+    # of silently repriced toward market (a clamped TP could price
+    # below its line's cost; a clamped deep rung above its line).
+    _CUSTOM_PRICE_REACH = 0.019
 
     minimal_roi = {"0": 100}
     stoploss = -0.25
@@ -218,17 +308,49 @@ class GridStrategy(IStrategy):
         # (order_filled fires once per order; the guard is just belt and
         # braces against double invocation in odd exchange paths)
         self._applied_fills: set = set()
+        # Warm-up covers the TF-rescaled trend EMA. The slot TF comes
+        # from the config's "timeframe" when the deployer pins one (the
+        # resolver overrides self.timeframe from the same key AFTER
+        # construction, so reading config here sees the final value).
+        slot_tf = (self.config or {}).get("timeframe") or self.timeframe
+        self.startup_candle_count = max(
+            type(self).startup_candle_count,
+            _trend_ema_period(slot_tf) + 40)
 
     # --- helpers -----------------------------------------------------
 
+    # Sanity band for the injected ladder. The deployer only ever writes
+    # 0.0 (kill) or 0.25/0.40/0.50; anything outside [0, 1] is a corrupt
+    # deploy (NaN, inf, a negative, or "25" meaning 25%), never a licence
+    # to allocate more.
+    LADDER_MAX_PCT = 1.0
+
     def _ladder_pct_cfg(self) -> float:
         """ladder_pct injected by the deployer (M4 ladder): 0.25/0.40/0.50
-        scale alloc; 0.0 = kill gate (stop new entries); absent → 1.0."""
+        scale alloc; 0.0 = kill gate (stop new entries); absent → 1.0.
+
+        FAIL-CLOSED on corrupt input. The old `except: return 1.0` turned
+        an unreadable/corrupt ladder into the LARGEST possible allocation
+        (2x the documented full tier of 0.50) and bypassed the kill gate
+        entirely — the single most dangerous failure mode in the file.
+        Absent still means 1.0 (no ladder deployed: backtest / hyperopt /
+        smoke runs must keep trading).
+        """
         raw = (self.config or {}).get("ladder_pct")
-        try:
-            return float(raw) if raw is not None else 1.0
-        except (TypeError, ValueError):
+        if raw is None:
             return 1.0
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(val) or val < 0.0 or val > self.LADDER_MAX_PCT:
+            return 0.0
+        return val
+
+    def _ladder_killed(self) -> bool:
+        """M4 kill gate: the archetype is measured AND recently
+        unprofitable, or the ladder config is corrupt → take no new risk."""
+        return self._ladder_pct_cfg() <= 0.0
 
     def _alloc_usd(self) -> float:
         """Grid notional, scaled by the deployer's ladder_pct (M4 ledger
@@ -241,8 +363,70 @@ class GridStrategy(IStrategy):
         return 2 * float(self.spread_pct.value) + round_trip_fee_pct(
             self.venue, taker=self.use_taker_fee)
 
+    def _trip_economics_ok(self, step_pct: float, strict: bool = True
+                           ) -> bool:
+        """Validate that one grid round trip is actually profitable.
+
+        A trip buys at lines[i] and sells at lines[i]*(1+step/100), so the
+        GROSS harvest is exactly `step_pct` percent. It is profitable only
+        when step_pct exceeds the round-trip cost (spread + fees); the
+        entry gate additionally requires min_step_multiple x cost so the
+        edge is not one bad tick away from churn.
+
+        `strict=False` relaxes to the hard break-even bar only.
+
+        Guards the two ways a live grid can end up with a loss-making step
+        even though the entry gate was sound when the grid was built:
+          * grid state restored from disk after a param change / downgrade;
+          * params edited (or hyperopt space re-tuned) mid-trade.
+        """
+        if not (math.isfinite(step_pct) and step_pct > 0.0):
+            return False
+        cost = self._cost_floor()
+        if not (math.isfinite(cost) and cost >= 0.0):
+            return False
+        bar = cost * (float(self.min_step_multiple.value) if strict else 1.0)
+        return step_pct > bar
+
+    def _finite_pos(self, *values) -> bool:
+        """Every value is a finite number — guards NaN/inf/None leaking out
+        of an indicator warm-up (ta.ATR/ta.EMA produce NaN for the first
+        `timeperiod` candles) or a corrupt state file into the geometry,
+        where NaN silently collapses the channel to [nan, nan] and poisons
+        every downstream price and stake."""
+        for v in values:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(f):
+                return False
+        return True
+
+    def _safe_float(self, value, default=0.0) -> float:
+        """float() that treats NaN/inf/None as `default`.
+
+        Indicator warm-up rows are NaN, and NaN is TRUTHY in Python — the
+        old `float(x) if x else 0.0` guard passed NaN straight into the
+        geometry, where it produced a NaN channel and NaN order prices.
+        """
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return default
+        return f if math.isfinite(f) else default
+
     def _build_grid(self, pair: str, price: float, atr_pct: float) -> dict:
         """Compute channel + lines and store grid state for `pair`."""
+        # Degenerate-input guard: a non-finite or non-positive price/ATR
+        # (indicator warm-up, a zero/NaN candle, a bad state file) would
+        # previously build a NaN channel and hand NaN prices to the
+        # exchange. Fall back to a single-line grid at `price` so the
+        # caller can still place a sane order instead of a poisoned one.
+        if not self._finite_pos(price) or price <= 0.0:
+            price = 1.0
+        if not self._finite_pos(atr_pct) or atr_pct < 0.0:
+            atr_pct = 0.0
         raw_step_pct = atr_pct * self.step_factor.value
         s = fee_floor_step(raw_step_pct, self.spread_pct.value, self.venue,
                            step_min=self.step_min, step_max=self.step_max,
@@ -266,11 +450,36 @@ class GridStrategy(IStrategy):
         return self._grids.get(pair)
 
     def _per_line_stake(self, state: dict) -> float:
-        return per_line_size(self._alloc_usd(), len(state["lines"]),
+        return per_line_size(self._alloc_usd(), max(len(state["lines"]), 1),
                              self.min_cost.value)
+
+    def _armed_rungs(self, state: dict, per_line: float) -> int:
+        """How many adverse-side rungs the allocation can ACTUALLY fund.
+
+        Capital-aware ladder depth (the dynamic-adaptation fix for the
+        inert-ladder defect). per_line_size() floors every line at the
+        exchange minimum, so a dense grid at a low ladder tier used to
+        commit far more than it was allocated: the budget is the ceiling,
+        and when `min_cost` x full side depth does not fit we arm FEWER
+        rungs rather than over-commit capital (we never shrink an order
+        below the exchange minimum — the order would simply be rejected).
+
+        Returns 0 when even ONE rung is unaffordable: the caller must
+        place no grid order at all rather than blow the budget.
+        """
+        budget = self._alloc_usd() * float(self.max_commit_ratio)
+        if not self._finite_pos(per_line, budget) or per_line <= 0.0:
+            return 0
+        if budget < per_line:
+            return 0
+        affordable = int(budget // per_line)
+        side = side_lines_count(len(state["lines"]))
+        return max(1, min(side, affordable))
 
     def _lines_below_mid(self, state: dict) -> int:
         mid = (state["low"] + state["high"]) / 2.0
+        if not self._finite_pos(mid):
+            return 1
         return sum(1 for ln in state["lines"] if ln < mid)
 
     # --- order-confirmed line bookkeeping (desync fix) -----------------
@@ -317,7 +526,12 @@ class GridStrategy(IStrategy):
         state."""
         if not min_stake:
             return 0.0
-        return float(min_stake) / (1.0 - abs(self.stoploss)) * 1.02
+        # guard: a stoploss of -1.0 (or worse) makes the reserve factor
+        # 1/(1-|sl|) blow up to inf/ZeroDivisionError
+        denom = 1.0 - abs(float(self.stoploss or 0.0))
+        if denom <= 1e-9:
+            return float(min_stake)
+        return float(min_stake) / denom * 1.02
 
     def _sell_viable(self, trade, per_line, current_exit_rate, min_stake,
                      max_stake) -> bool:
@@ -331,8 +545,14 @@ class GridStrategy(IStrategy):
         sell_stake = min(per_line, max_stake)
         amount = sell_stake * trade.amount / trade.stake_amount
         remaining = (trade.amount - amount) * current_exit_rate
-        # remaining == 0 is a full close — always allowed
-        return remaining == 0.0 or remaining >= bar
+        # A full close is always allowed. Compare with a tolerance: float
+        # arithmetic on (amount - amount) leaves ~1e-13 dust, and the old
+        # exact `remaining == 0.0` test then sent a full close through the
+        # remaining-position bar, where it could be vetoed and deadlock
+        # the loop (pre-fall-through shape).
+        if abs(remaining) <= max(1e-9, abs(bar) * 1e-6):
+            return True
+        return remaining >= bar
 
     # --- grid-state persistence (live/dry-run restarts) --------------
 
@@ -434,9 +654,34 @@ class GridStrategy(IStrategy):
                     "refills": {int(k): int(v)
                                 for k, v in snap.get("refills", {}).items()},
                 }
+                if not self._grid_state_sane(state):
+                    # A corrupt/partial snapshot (interrupted write, an
+                    # older schema, NaN lines) would otherwise be trusted
+                    # for the whole session: every grid price and stake
+                    # derives from it. Drop the pair and let it re-anchor
+                    # on the next entry instead.
+                    continue
                 self._grids[pair] = state
             except (KeyError, TypeError, ValueError):
                 continue
+
+    def _grid_state_sane(self, state: dict) -> bool:
+        """Structural validation of a (built or restored) grid state.
+
+        Rejects the three ways a state can be well-formed JSON but
+        financially poisonous: no lines, non-finite/non-positive prices,
+        or a non-positive step (which makes every TP sit at or below its
+        buy line — a guaranteed loss per round trip).
+        """
+        lines = state.get("lines") or []
+        if not lines:
+            return False
+        if not all(self._finite_pos(ln) and ln > 0.0 for ln in lines):
+            return False
+        if not self._finite_pos(state.get("low"), state.get("high")):
+            return False
+        step = state.get("step_pct")
+        return self._finite_pos(step) and float(step) > 0.0
 
     # --- freqtrade interface ----------------------------------------
 
@@ -450,7 +695,10 @@ class GridStrategy(IStrategy):
         dataframe["atr_pct"] = dataframe["atr"] / dataframe["close"] * 100 \
             * _atr_scale(self.timeframe)
         dataframe["ema_short"] = ta.EMA(dataframe, timeperiod=12)
-        dataframe["ema_long"] = ta.EMA(dataframe, timeperiod=26)
+        # trend horizon rescale (26h-equivalent on every slot TF) — see
+        # _trend_ema_period. On 1h this is exactly EMA26, the tuned gate.
+        dataframe["ema_long"] = ta.EMA(
+            dataframe, timeperiod=_trend_ema_period(self.timeframe))
         return dataframe
 
     def _entry_gate_atr(self) -> float:
@@ -497,15 +745,58 @@ class GridStrategy(IStrategy):
                            proposed_rate: float, entry_tag: str | None,
                            side: str, **kwargs) -> float:
         if trade is not None:
-            # Position-adjustment order (grid buy): keep the existing grid
-            # state — rebuilding here would wipe filled/refill sets.
+            # Position-adjustment order (grid buy): rest AT the line so a
+            # fill banks the full step to TP, not whatever window position
+            # the market happened to be at (see the module docstring's
+            # resting-ladder note). Never rebuild the grid here — that
+            # would wipe filled/refill sets.
+            m = _GRID_BUY_TAG_RE.match(entry_tag or "")
+            state = self._grid_state(pair)
+            if m and state:
+                idx = int(m.group(1))
+                if idx < len(state["lines"]):
+                    return state["lines"][idx]
             return proposed_rate
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if dataframe is None or len(dataframe) == 0:
+            # No analyzed dataframe (first candle, a reload race, a pair
+            # the bot just dropped): `dataframe.iloc[-1]` raised IndexError
+            # and killed the entry callback. Fall back to the rate
+            # freqtrade already priced rather than crashing the loop.
+            return proposed_rate
         last = dataframe.iloc[-1]
-        state = self._build_grid(pair, float(last["close"]),
-                                 float(last["atr_pct"]))
+        close = self._safe_float(last.get("close"))
+        atr_pct = self._safe_float(last.get("atr_pct"), default=0.0)
+        if not (close and close > 0.0):
+            return proposed_rate
+        state = self._build_grid(pair, close, atr_pct)
         line, _above = closest_levels(state["lines"], proposed_rate)
-        return line
+        return line if self._finite_pos(line) and line > 0.0 \
+            else proposed_rate
+
+    def custom_exit_price(self, pair: str, trade: Trade,
+                          current_time: datetime, proposed_rate: float,
+                          current_profit: float, exit_tag: str | None,
+                          **kwargs) -> float:
+        # grid_sell_Lj partial exits rest at the line's TP
+        # (lines[j] x (1 + step)): the trip banks exactly the step when
+        # price touches it, instead of waiting for a loop iteration that
+        # still finds rate >= TP. grid_flatten_Lj (the min-exit-veto
+        # fallback in adjust_trade_position) sells the WHOLE position at
+        # lines[j]'s TP. Full exits (channel_top/bottom_exit, stoploss,
+        # roi) carry no L-tag and keep the proposed rate.
+        m = _GRID_SELL_TAG_RE.match(exit_tag or "")
+        state = self._grid_state(pair)
+        if m and state:
+            idx = int(m.group(1))
+            if idx < len(state["lines"]):
+                return state["lines"][idx] * (1 + state["step_pct"] / 100.0)
+        mf = _GRID_FLATTEN_TAG_RE.match(exit_tag or "")
+        if mf and state:
+            idx = int(mf.group(1))
+            if idx < len(state["lines"]):
+                return state["lines"][idx] * (1 + state["step_pct"] / 100.0)
+        return proposed_rate
 
     def custom_stake_amount(self, pair: str, current_time: datetime,
                             proposed_stake: float, min_stake: float | None,
@@ -517,10 +808,15 @@ class GridStrategy(IStrategy):
             # entry_price callback did not run (should not happen); build
             # from proposed rate with a neutral atr_pct fallback.
             dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if dataframe is None or len(dataframe) == 0:
+                return min_stake or 0.0
             last = dataframe.iloc[-1]
-            atr_pct = float(last["atr_pct"]) if last["atr_pct"] else 0.0
-            state = self._build_grid(pair, float(last["close"]), atr_pct)
+            atr_pct = self._safe_float(last.get("atr_pct"), default=0.0)
+            close = self._safe_float(last.get("close"))
+            state = self._build_grid(pair, close if close else 1.0, atr_pct)
         stake = self._per_line_stake(state)
+        if not self._finite_pos(stake) or stake <= 0.0:
+            return min_stake or 0.0
         lo = min_stake or 0.0
         return max(lo, min(stake, max_stake))
 
@@ -542,6 +838,13 @@ class GridStrategy(IStrategy):
         state = self._grid_state(trade.pair)
         if state is None:
             return None
+        # M4 kill gate / corrupt ladder: confirm_trade_entry only blocks NEW
+        # trades, so a position opened before the kill (or under a corrupt
+        # ladder) kept DCA-ing into a regime the ledger had already
+        # condemned. Averaging into a losing archetype is the single most
+        # expensive thing this strategy can do.
+        if self._ladder_killed():
+            return None
         lines = state["lines"]
         filled = state["filled"]
         refills = state["refills"]
@@ -556,61 +859,121 @@ class GridStrategy(IStrategy):
             per_line = min_stake
         step = state["step_pct"]
         pending = self._pending_line_orders(trade)
+        reach = self._CUSTOM_PRICE_REACH
+        pending_buys = {i for i, sides in pending.items() if "buy" in sides}
+        pending_sells = {i for i, sides in pending.items() if "sell" in sides}
 
-        # --- GRID SELL (checked first) ---
-        # highest filled line whose TP is reached and which has no
-        # resting sell order already working that level
+        # freqtrade keeps at most ONE open order per trade on this path:
+        # placing an order that differs from the resting one CANCELS the
+        # resting one (freqtradebot.handle_similar_open_order, REPLACE).
+        # So this method works a single desired order at a time, sticks
+        # with it while it rests (no ping-pong replaces), and only swaps
+        # sides when the tape actually moved:
+        #   sell -> buy: rate fell below the parked sell's line (falling
+        #     tape — keep laddering down; the sell re-parks on recovery)
+        #   buy -> sell: a filled line's TP came into reach (rate >= the
+        #     line) — harvesting outranks a buy resting further below.
+
+        # --- desired GRID SELL: lowest filled line whose TP is both
+        # clamp-safe (within freqtrade's 2% custom-price envelope — else
+        # get_valid_price would drag it toward market, possibly below
+        # the line's cost) and near enough to matter (rate >= line). ---
         best_j = None
         for j, ln in enumerate(lines):
-            if j in filled and "sell" not in pending.get(j, ()):
-                if current_exit_rate >= ln * (1 + step / 100.0):
-                    if best_j is None or lines[best_j] < ln:
-                        best_j = j
-        if best_j is not None:
-            if not self._sell_viable(trade, per_line, current_exit_rate,
-                                     min_stake, max_stake):
-                # freqtrade would veto the reduce below its
-                # remaining-position minimum; keep the line filled and
-                # retry once more inventory (or price movement) allows it.
-                return None
-            stake = -min(per_line, max_stake)
-            return (stake, f"grid_sell_L{best_j}")
+            tp = ln * (1 + step / 100.0)
+            if (j in filled and current_exit_rate >= ln
+                    and current_exit_rate * (1 + reach) >= tp):
+                best_j = j
+                break  # lowest line first — the nearest TP fills soonest
+        if best_j is not None and best_j not in pending_sells:
+            if self._sell_viable(trade, per_line, current_exit_rate,
+                                 min_stake, max_stake):
+                stake = -min(per_line, max_stake)
+                return (stake, f"grid_sell_L{best_j}")
+            # freqtrade would veto the one-line reduce below its
+            # remaining-position minimum (the 2-lot trap: selling one
+            # ~min_stake lot leaves ~1 lot < the bar, so a small position
+            # can never partially exit — and with a capital-bounded
+            # ladder depth the buy branch below may ALSO be budget-full,
+            # which would park the position until the channel exits).
+            # Flatten the WHOLE position at the HIGHEST filled line's TP
+            # instead: every lot banks at least (its line -> top TP),
+            # structurally fee-positive. The `grid_flatten_Li` tag
+            # deliberately does NOT match the ledger's grid_(buy|sell)_Li
+            # regex: the M4 pairing treats it as the trade's full exit —
+            # one clean full_exit trip per lot, no state-anomaly surprise.
+            top = max(filled) if filled else None
+            if top is not None and "sell" not in pending.get(top, ()):
+                tp_top = lines[top] * (1 + step / 100.0)
+                if (current_exit_rate >= lines[top]
+                        and current_exit_rate * (1 + reach) >= tp_top):
+                    return (-float(trade.stake_amount),
+                            f"grid_flatten_L{top}")
+            # otherwise keep the lines filled and FALL THROUGH to the buy
+            # branch — more inventory is exactly what lifts the veto
+            # (returning None here deadlocked the grid: the decided sell
+            # re-fired every loop and buys never ran again).
 
-        # --- GRID BUY ---
-        max_buys = self._lines_below_mid(state)
-        pending_buys = {i for i, sides in pending.items() if "buy" in sides}
+        # --- desired GRID BUY: resting limit AT the line (ladder) ---
+        # Depth is capital-aware AND geometry-aware (see _armed_rungs): the
+        # ladder arms as many adverse-side rungs as the ladder-scaled
+        # allocation can actually fund at >= min_cost. Without this the
+        # min_cost floor made every tier commit the same (and, at base
+        # tier, ~1.6x its own budget).
+        armed = self._armed_rungs(state, per_line)
+        max_buys = min(self._lines_below_mid(state), armed)
         if len(filled | pending_buys) >= max_buys:
             return None
         if current_entry_rate > lines[-1]:
             # price above the channel top: channel_top_exit fires this very
             # candle, so buying now would be exited flat in the same candle
             return None
-        # Fee-viable buy window: a grid buy fills at the CURRENT rate
-        # somewhere inside the line's window, while its TP is fixed at
-        # line * (1 + step). Filling near the TP edge harvests less than
-        # the round-trip cost (fee-negative churn — the M5 fee bar), so
-        # every window (fresh line AND refill) is capped at the price
-        # where the TP still clears the cost. The entry gate already
-        # guarantees step >= min_step_multiple x cost, so this headroom
-        # is positive for any grid the gate let through.
-        headroom = step - self._cost_floor()
-        if headroom <= 0.0:
+        # Profit validation on the round trip about to be opened. The entry
+        # gate guarantees step >= min_step_multiple x cost at BUILD time,
+        # but a grid restored from disk or re-parameterised mid-trade can
+        # carry a step that no longer clears fees — and a loss-making step
+        # is churn that pays the venue on every fill. Strict bar first
+        # (configured margin), hard break-even backstop second so a
+        # mis-set min_step_multiple can never veto a profitable trip while
+        # a genuinely fee-negative one is always refused.
+        if not (self._trip_economics_ok(step)
+                or self._trip_economics_ok(step, strict=False)):
             return None
-        # Highest line whose buy window contains the current price.
-        # Bounded by max_refills_per_line.
+        # Highest eligible line in the placement envelope:
+        #   upper edge — at most half a step ABOVE the rate: a marketable
+        #     limit at the line fills immediately when price gapped
+        #     through the line between loops (the rung is still captured
+        #     at the line price, harvest still the full step);
+        #   lower edge — at most _CUSTOM_PRICE_REACH below the rate:
+        #     deeper rungs would be clamped by get_valid_price toward
+        #     market; they enter the envelope as price descends, so the
+        #     ladder slides with price a couple of rungs deep.
         best_i = None
+        upper_rate = current_entry_rate * (1 + step / 2 / 100.0)
+        lower_rate = current_entry_rate * (1 - reach)
         for i, ln in enumerate(lines):
             if i in filled or i in pending_buys:
                 continue
             n_refills = refills.get(i, 0)
             if n_refills >= self.max_refills_per_line:
                 continue
-            upper = ln * (1 + headroom / 100.0)
-            if ln < current_entry_rate < upper:
+            if lower_rate <= ln <= upper_rate:
                 if best_i is None or lines[best_i] < ln:
                     best_i = i
         if best_i is None:
             return None
+        # single-order discipline: never stack or churn resting orders
+        if pending_buys:
+            # a buy is already working a rung; re-deciding it would cancel
+            # and re-place it every loop (REPLACE) without changing odds
+            return None
+        if pending_sells:
+            # a TP sell is parked above; only swap it for a buy when the
+            # rate fell below the parked sell's line — price oscillating
+            # above the line keeps the harvest parked instead
+            parked = min(pending_sells)
+            if current_entry_rate >= lines[parked]:
+                return None
         # reserve room for the pending buys' notional too — their stake
         # is not in trade.stake_amount until they fill
         new_total = trade.stake_amount + per_line * (1 + len(pending_buys))
@@ -633,7 +996,7 @@ class GridStrategy(IStrategy):
                 return
             self._applied_fills.add(oid)
         idx = self._grid_tag_line(order)
-        if idx is None or idx >= len(state["lines"]):
+        if idx is None or idx < 0 or idx >= len(state["lines"]):
             return
         if order.ft_order_side == "buy":
             state["filled"].add(idx)
@@ -647,7 +1010,7 @@ class GridStrategy(IStrategy):
                     current_rate: float, current_profit: float,
                     **kwargs):
         state = self._grid_state(pair)
-        if state is None:
+        if state is None or not self._finite_pos(current_rate):
             return None
         if current_rate > state["lines"][-1]:
             return "channel_top_exit"

@@ -731,6 +731,15 @@ function instanceCardHTML(i) {
         : ""}`
       : "flat"),
     row("realized", `<span class="mono">${fmtSignedUsd(realized)}</span> · ${i.closed_trades ?? 0} closed · ${i.fills ?? 0} grid fills (${i.fills_24h ?? 0}/24h)`),
+    row("grid harvest", (() => {
+      const h = Number(i.grid_harvest || 0);
+      const trips = i.grid_trips ?? 0;
+      const h24 = Number(i.grid_harvest_24h || 0);
+      const t24 = i.grid_trips_24h ?? 0;
+      return `<span class="mono ${h > 0 ? "m-value--good" : h < 0 ? "m-value--bad" : ""}">${fmtSignedUsd(h)}</span>`
+        + ` · ${trips} trips (${t24}/24h ${fmtSignedUsd(h24)})`
+        + ` <span class="badge badge--dim" title="realized cash from completed per-line round trips (grid_buy_Li paired FIFO with grid_sell_Li), net of fees — honest on open trades, unlike freqtrade's average-cost realized which books partial exits against the position's mean entry">per-line</span>`;
+    })()),
     row("channel", ch.low != null
       ? `<span class="mono">${fmtPrice(ch.low)} \u2013 ${fmtPrice(ch.high)} · step ${fmtNum(ch.step_pct, 2)}% · ${ch.grids ?? "—"} lines</span> <span class="badge badge--dim" title="recomputed live from the engine's last analyzed candle — GridStrategy never persists geometry">live</span>`
       : "computing\u2026"),
@@ -785,6 +794,8 @@ function renderFleetInstances(instances, board) {
     const sig = [i.status, i.api_ok, i.api_backoff, i.wallet_total, i.open_trades,
                  i.open_profit_abs, i.open_profit_pct, i.open_enter_tag, i.realized,
                  i.closed_trades, i.fills, i.fills_24h, i.last_fill_at,
+                 i.grid_harvest, i.grid_harvest_24h, i.grid_trips,
+                 i.grid_trips_24h,
                  i.started_at, i.channel_live && i.channel_live.grids,
                  i.channel_live && i.channel_live.step_pct,
                  i.channel_live && i.channel_live.low,
