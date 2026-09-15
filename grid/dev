@@ -14,6 +14,10 @@ Usage:
   grid/dev logs [ft|console|pb|<bot>] [lines]
   grid/dev open                      open the console #fleet page in a browser
   grid/dev ledger                    reliability-ledger summary (M4)
+  grid/dev ledger-sync               ingest every instance's live tradesv3.sqlite
+                                     into the ledger + archive (M4 cron seam)
+  grid/dev screen [--top N]          rank Hyperliquid USDC perps by ATR%×volume
+  grid/dev rotate [--top N] [--yes]  swap weak slots onto top-ranked pairs
 
 What this manages (the standalone runtime):
   pocketbase  the vendored PocketBase sidecar on 127.0.0.1:8290 (grid/.pocketbase/,
@@ -23,12 +27,14 @@ What this manages (the standalone runtime):
   console   grid/console/server.py on 127.0.0.1:8798 — the mission console
             (state: grid/state/, engine banner from state/engine.json)
   engine    the dry-run freqtrade fleet — 4 slots × 150 USDC on Hyperliquid
-            USDC perps (BTC / ETH / SOL / HYPE, 1h, GridStrategy with the
-            M2-tuned params band_atr 4.2 / step_factor 0.21; pairs verified
-            active in ccxt). Instance dirs + registry entries live in
-            grid/state/ft_fleet/<bot>/ using the SAME layout and entry
-            schema as the M3 backend, so the console fleet row (and the M3
-            daemon, once it lands) read them natively.
+            USDC perps (BTC / ETH / SOL / HYPE, 1h, GridStrategy; pairs
+            verified active in ccxt). Params band_atr 4.2 / step_factor 1.0
+            (taker-viable baseline — M2's 0.21 was maker-modeled and must be
+            re-hyperopted). alloc scales by the M4 reliability ladder
+            (ladder_pct injected into each config). Instance dirs + registry
+            entries live in grid/state/ft_fleet/<bot>/ using the SAME layout
+            and entry schema as the M3 backend, so the console fleet row (and
+            the M3 daemon, once it lands) read them natively.
 
 What this deliberately does NOT manage:
   the autonomy brain (screen → LLM swarm → deploy). It is still M3-in-flight
@@ -86,6 +92,17 @@ SLOTS = {
     "ft-hype": ("HYPE/USDC:USDC", "HYPEUSDC"),
 }
 DRY_RUN_WALLET = 150.0                           # per slot — 4 × 150 = 600
+
+# density: one open trade per instance (multi-pair-per-instance = raise this
+# AND widen the whitelist; level-multiplexed fleet stays M5 scope)
+MAX_OPEN_TRADES = 1
+# Hyperliquid public API throttle: each instance's ccxt rateLimit in ms, so
+# the 4-slot fleet stays under the shared 429 budget (producer/consumer is
+# the real fix, this is the cheap mitigation)
+CCXT_RATE_LIMIT_MS = 500
+# ladder archetype for the standalone long-grid fleet (canonical M4 label)
+LADDER_ARCHETYPE = "Long Grid / classic LONG"
+SLOTS_OVERRIDE = STATE / "slots.json"            # `rotate` writes pair swaps here
 
 FT_BIN = WS / ".venv-ft" / "bin" / "freqtrade"    # load-bearing for M3 — read-only use
 STRATEGY_SRC = GRID / "strategies"               # GridStrategy.py/.json + grid_geometry.py
@@ -181,16 +198,77 @@ def save_registry(reg):
     tmp.replace(REGISTRY)
 
 
+def effective_slots():
+    """SLOTS with any `rotate` pair swaps applied (state/slots.json)."""
+    slots = dict(SLOTS)
+    try:
+        over = json.loads(SLOTS_OVERRIDE.read_text())
+        if isinstance(over, dict):
+            for k, v in over.items():
+                if isinstance(v, list) and len(v) == 2 and \
+                        isinstance(v[0], str) and isinstance(v[1], str):
+                    slots[k] = (v[0], v[1])
+    except Exception:
+        pass
+    return slots
+
+
+def _ladder_pct():
+    """Fraction of alloc_usd to deploy, from the M4 reliability ladder for
+    the long-grid archetype: base 0.25 (no evidence) → probe 0.40 → full
+    0.50; 0.0 when the kill gate fires (≥10 samples & recent_pf < 1.0).
+    Falls back to 1.0 (unscaled) only if the ledger module is unavailable."""
+    try:
+        sys.path.insert(0, str(WS))
+        from grid.reliability import ledger as m4
+        led = json.loads(RELIABILITY.read_text()) if RELIABILITY.is_file() \
+            else {}
+        if m4.refuse_new_archetype(led, LADDER_ARCHETYPE):
+            return 0.0
+        mult, _tier, _st = m4.size_multiplier(led, LADDER_ARCHETYPE)
+        return float(mult)
+    except Exception:
+        return 1.0
+
+
+def _ladder_tier():
+    """Human-readable ladder tier for the registry entry (informational)."""
+    try:
+        sys.path.insert(0, str(WS))
+        from grid.reliability import ledger as m4
+        led = json.loads(RELIABILITY.read_text()) if RELIABILITY.is_file() \
+            else {}
+        if m4.refuse_new_archetype(led, LADDER_ARCHETYPE):
+            return "KILLED"
+        _mult, tier, _st = m4.size_multiplier(led, LADDER_ARCHETYPE)
+        return tier
+    except Exception:
+        return "base"
+
+
+def _arg_int(args, flag, default):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            try:
+                return int(args[i + 1])
+            except ValueError:
+                pass
+    return default
+
+
 # ── engine (dry-run freqtrade instance) ─────────────────────────────────
 
-def engine_config(port, username, password, pair, pair_code):
+def engine_config(port, username, password, pair, pair_code, ladder_pct=None):
     """The instance config — mirrors the verified ft_user_data/config.json
     (hyperliquid futures/isolated dry-run, backtested M1/M2 shape) plus the
-    api_server + initial_state the M3 backend adds per instance."""
+    api_server + initial_state the M3 backend adds per instance. `ladder_pct`
+    (M4 reliability ladder) scales the strategy's alloc; None → compute here."""
     return {
         "exchange": {
             "name": "hyperliquid", "key": "", "secret": "",
-            "ccxt_config": {}, "ccxt_async_config": {},
+            "ccxt_config": {"rateLimit": CCXT_RATE_LIMIT_MS},
+            "ccxt_async_config": {"rateLimit": CCXT_RATE_LIMIT_MS},
             "pair_whitelist": [pair], "pair_blacklist": [],
         },
         "trading_mode": "futures",
@@ -200,7 +278,8 @@ def engine_config(port, username, password, pair, pair_code):
         "stake_currency": "USDC",
         "stake_amount": "unlimited",
         "timeframe": "1h",
-        "max_open_trades": 1,
+        "ladder_pct": ladder_pct if ladder_pct is not None else _ladder_pct(),
+        "max_open_trades": MAX_OPEN_TRADES,
         "entry_pricing": {"price_side": "same", "use_order_book": True,
                           "order_book_top": 1},
         "exit_pricing": {"price_side": "same", "use_order_book": True,
@@ -226,7 +305,9 @@ def materialize(bot_code):
     """Create/refresh one instance dir + registry entry (idempotent).
     Reuses an existing entry's port/credentials so a restarted instance
     keeps its trades database and console identity."""
-    pair, pair_code = SLOTS[bot_code]
+    pair, pair_code = effective_slots()[bot_code]
+    ladder = _ladder_pct()
+    tier = _ladder_tier()
     bot_dir = FLEET / bot_code
     reg = load_registry()
     entry = reg["instances"].get(bot_code)
@@ -251,8 +332,8 @@ def materialize(bot_code):
     for fn in STRATEGY_FILES:
         shutil.copy2(STRATEGY_SRC / fn, bot_dir / "strategies" / fn)
     with open(bot_dir / "config.json", "w") as f:
-        json.dump(engine_config(port, username, password, pair, pair_code),
-                  f, indent=2)
+        json.dump(engine_config(port, username, password, pair, pair_code,
+                                ladder_pct=ladder), f, indent=2)
 
     entry = {
         "bot_code": bot_code,
@@ -267,12 +348,14 @@ def materialize(bot_code):
         "exchange_code": "HYPERLIQUID_SWAP",
         "grid_type": "long",
         "slot_balance": DRY_RUN_WALLET,
+        "ladder_pct": ladder,
+        "ladder_tier": tier,
         "channel": {
             "low": None, "mid": None, "high": None,
             "step_pct": None, "atr_pct": None,
             "grids": None,
             "note": "channel computed at runtime by GridStrategy "
-                     "(tuned params band_atr 4.2, step_factor 0.21)",
+                     "(tuned params band_atr 4.2, step_factor 1.0 taker-viable)",
         },
         "created_at": entry.get("created_at") if entry else _utcnow(),
         "pid": None,
@@ -322,7 +405,7 @@ def engine_start():
     env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
     env["PYTHONUNBUFFERED"] = "1"
     spawned = []
-    for bot_code in SLOTS:
+    for bot_code in effective_slots():
         running, pid = engine_running(
             load_registry()["instances"].get(bot_code))
         if running:
@@ -348,9 +431,12 @@ def engine_start():
             reg["instances"][bot_code]["status"] = "starting"
             save_registry(reg)
         print(f"engine {bot_code} starting (pid {proc.pid}, port {port}, "
-              f"{SLOTS[bot_code][0]} 1h DRY-RUN · wallet {DRY_RUN_WALLET}, "
+              f"{entry['pair']} 1h DRY-RUN · wallet {DRY_RUN_WALLET}, "
               f"Hyperliquid)")
         spawned.append((bot_code, bot_dir, proc, port))
+        # stagger spawns so the 4-slot fleet doesn't burst the shared
+        # Hyperliquid rate budget at startup (see CCXT_RATE_LIMIT_MS)
+        time.sleep(2)
     if not spawned:
         return
     # wait for every spawned engine's /ping in parallel — Hyperliquid
@@ -647,7 +733,7 @@ def cmd_status():
              if running else
              f"  → start: {Path(__file__).name} start"))
     reg = load_registry()
-    codes = sorted(set(list(reg["instances"]) + list(SLOTS)))
+    codes = sorted(set(list(reg["instances"]) + list(effective_slots())))
     for bot_code in codes:
         entry = reg["instances"].get(bot_code)
         running, pid = engine_running(entry)
@@ -667,7 +753,8 @@ def cmd_status():
                   f"start: {Path(__file__).name} start")
     arch = len(reg.get("archived") or [])
     print(f"ft_fleet registry: {len(reg['instances'])} instance(s) · "
-          f"{arch} archived · {len(SLOTS)} slots × {DRY_RUN_WALLET} USDC")
+          f"{arch} archived · {len(effective_slots())} slots × "
+          f"{DRY_RUN_WALLET} USDC")
     print(f"brain (autonomy) : NOT in this repo — M3 in flight in "
           f"grid-autonomy; the WT-era daemon was closed with the legacy "
           f"engine (see state/engine.json)")
@@ -681,7 +768,7 @@ def cmd_logs(which="ft", n=40):
         path, label = CONSOLE_LOG, "console"
     elif which == "pb":
         path, label = STATE / "logs" / "pb.log", "pocketbase"
-    elif which in SLOTS:
+    elif which in effective_slots():
         path, label = FLEET / which / "freqtrade.log", f"engine {which}"
     else:
         path, label = FLEET / "ft-btc" / "freqtrade.log", "engine ft-btc"
@@ -725,6 +812,117 @@ def cmd_reset(yes=False):
     if carried:
         print(f"carried over    : {', '.join(carried)}")
     print("state is clean — start the fleet: grid/dev start")
+
+
+def cmd_screen(args):
+    """Rank the Hyperliquid USDC-perp universe by ATR%×volume (observational
+    only — writes state/screen_cache.json for `rotate`)."""
+    sys.path.insert(0, str(GRID))
+    import screen
+    screen.main(args)
+
+
+def cmd_rotate(args):
+    """Swap weak slots onto top-ranked pairs from the screen cache.
+
+    A slot is "weak" when its current pair is not in the top-N ranked
+    screen list. Proposes swaps, then (with --yes) stops the affected
+    engines, rematerializes them onto the best unheld ranked pairs, writes
+    the override to state/slots.json, and restarts the fleet. Dry-run only:
+    the instances trade paper, never live."""
+    top = _arg_int(args, "--top", len(SLOTS))
+    yes = "--yes" in args
+    cache = STATE / "screen_cache.json"
+    if not cache.is_file():
+        sys.exit("no screen cache — run: grid/dev screen first")
+    try:
+        ranked = (json.loads(cache.read_text()) or {}).get("pairs") or []
+    except Exception:
+        sys.exit("screen cache unreadable — re-run: grid/dev screen")
+    ranked = [p for p in ranked
+              if isinstance(p, dict) and p.get("pair") and p.get("pair_code")][:top]
+    if not ranked:
+        sys.exit("screen cache empty — re-run: grid/dev screen")
+
+    slots = effective_slots()
+    score_of = {p["pair"]: p.get("score", 0.0) for p in ranked}
+    weak = [code for code, (pair, _c) in slots.items() if pair not in score_of]
+    if not weak:
+        print("no weak slots — every slot's pair is already top-ranked")
+        return
+
+    held = {pair for pair, _c in slots.values()}
+    available = [p for p in ranked if p["pair"] not in held]
+    over, swaps = {}, []
+    for code in weak:
+        if not available:
+            print(f"no unheld ranked pairs left to swap into {code}")
+            break
+        pick = available.pop(0)
+        over[code] = [pick["pair"], pick["pair_code"]]
+        swaps.append((code, slots[code][0], pick["pair"]))
+
+    print(f"proposed swaps ({len(swaps)}):")
+    for code, old, new in swaps:
+        print(f"  {code}: {old} -> {new}")
+    if not yes:
+        print("re-run with --yes to apply (stops affected engines, "
+              "rematerializes, writes state/slots.json, restarts)")
+        return
+
+    reg = load_registry()
+    for code, _old, _new in swaps:
+        entry = reg["instances"].get(code)
+        if isinstance(entry, dict):
+            running, pid = engine_running(entry)
+            if running:
+                print(f"engine {code} stopping (pid {pid})")
+                _terminate(pid)
+                entry["pid"] = None
+                entry["status"] = "stopped"
+                _pidfile_clear(code)
+    save_registry(reg)
+
+    merged = dict(SLOTS)
+    try:
+        prev = json.loads(SLOTS_OVERRIDE.read_text())
+        if isinstance(prev, dict):
+            merged.update({k: v for k, v in prev.items()
+                           if isinstance(v, list) and len(v) == 2})
+    except Exception:
+        pass
+    for code in over:
+        merged[code] = over[code]
+    SLOTS_OVERRIDE.parent.mkdir(parents=True, exist_ok=True)
+    SLOTS_OVERRIDE.write_text(json.dumps(
+        {k: v for k, v in merged.items() if tuple(v) != SLOTS.get(k)},
+        indent=2) + "\n")
+
+    for code, _old, new in swaps:
+        materialize(code)
+        print(f"engine {code} rematerialized on {new}")
+    engine_start()
+    print(f"rotate done — {len(swaps)} slot(s) swapped; override at "
+          f"{SLOTS_OVERRIDE}")
+
+
+def cmd_ledger_sync():
+    """Ingest every instance's live tradesv3.sqlite into the M4 reliability
+    ledger and archive it (the cron seam that feeds the ladder + kill gate
+    that engine_config reads via _ladder_pct)."""
+    sys.path.insert(0, str(WS))
+    from grid.reliability import ledger as m4
+    argv = []
+    for bot_code in effective_slots():
+        db = FLEET / bot_code / "tradesv3.sqlite"
+        if db.is_file():
+            argv += ["--sqlite", f"{db}={LADDER_ARCHETYPE}"]
+    if not argv:
+        print("no tradesv3.sqlite found — run: grid/dev start first")
+        return
+    argv += ["--save-archive", str(STATE / "reliability_archive.json"),
+             "--report"]
+    sys.exit(m4._cli(argv))
 
 
 def main(argv):
@@ -771,6 +969,14 @@ def main(argv):
             print(row)
         print("refresh: python3 -m grid.reliability.ledger "
               "--sqlite <db>=<archetype> --report   (M4 CLI)")
+        print("live fleet: grid/dev ledger-sync   (ingest every instance's "
+              "tradesv3.sqlite)")
+    elif cmd == "ledger-sync":
+        cmd_ledger_sync()
+    elif cmd == "screen":
+        cmd_screen(args)
+    elif cmd == "rotate":
+        cmd_rotate(args)
     else:
         print(__doc__)
         sys.exit(2)
