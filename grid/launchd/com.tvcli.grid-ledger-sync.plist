@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        grid-ledger-sync — every 6h, ingest every running FT instance's
+        tradesv3.sqlite into grid/state/reliability.json + archive.
+
+        Owns the M4 reliability cron seam: without this, the sizing ladder
+        + kill gate the engine reads at materialize time can never move off
+        'base' for the standalone long-grid archetype.
+
+        Install (one-time):
+          cp grid/launchd/com.tvcli.grid-ledger-sync.plist \
+             ~/Library/LaunchAgents/
+          launchctl load -w ~/Library/LaunchAgents/com.tvcli.grid-ledger-sync.plist
+
+        Status / manual trigger:
+          launchctl list | grep grid-ledger-sync
+          grid/dev ledger-sync   (same code path the plist runs)
+    -->
+    <key>Label</key>
+    <string>com.tvcli.grid-ledger-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Volumes/ExMac/code/grid/0/freqtrade/grid/launchd/grid-ledger-sync.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Volumes/ExMac/code/grid/0/freqtrade</string>
+    <key>StartInterval</key>
+    <integer>21600</integer>           <!-- 6h -->
+    <key>RunAtLoad</key>
+    <true/>                            <!-- first sync on install -->
+    <key>StandardOutPath</key>
+    <string>/Volumes/ExMac/code/grid/0/freqtrade/grid/state/logs/ledger-sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Volumes/ExMac/code/grid/0/freqtrade/grid/state/logs/ledger-sync.log</string>
+</dict>
+</plist>
