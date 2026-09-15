@@ -89,7 +89,7 @@ config + registry entry under `timeframe`.
 
 `./grid/dev reset --yes` (archive-only) + manual `rm -f` of stale
 `ft_user_data/data/hyperliquid/futures/*-1h-*` feathers so the engines
-download fresh 1m / 3m / 5m bars on first boot.
+start with an empty local cache.
 
 Archive: `grid/state.reset-20260915T031931Z/` (carried over
 `engine.json`, `llm.env`).
@@ -97,6 +97,22 @@ Archive: `grid/state.reset-20260915T031931Z/` (carried over
 Re-vendored `GridStrategy.py` + `GridStrategy.json` + `grid_geometry.py`
 into `ft_user_data/strategies/` after the strategy edits — the
 `test_vendored_sync` guardrail would have caught the drift anyway.
+
+### First-boot candle warm-up
+
+The reset doc originally said to pre-warm via `freqtrade download-data`
+— that doesn't work on Hyperliquid. The ccxt Hyperliquid implementation
+returns "Historic data not available for Hyperliquid" and the live
+engines do not need bulk history anyway: they stream one candle at a
+time from the per-tick ccxt `fetch_ohlcv` path and warm up from those
+live ticks (`startup_candle_count=60` per slot TF, so 60 min on the
+BTC slot, 5×60=300 min on the HYPE slot).
+
+`grid/scripts/prewarm_data.sh` was rewritten to detect this and exit 0
+with an explanation rather than fail; the script is still useful on
+exchanges that do support historical downloads (Binance, Bybit, OKX,
+…). Verified live: all 4 engines return real candles from `/api/v1/
+pair_candles` within seconds of start.
 
 ## Verified
 
@@ -112,12 +128,12 @@ into `ft_user_data/strategies/` after the strategy edits — the
 
 ## Risks / follow-ups
 
-- **First-boot data download is slow**: 90d × 1m for BTC alone is
-  ~130k bars, and 4 instances download in parallel off the shared HL
-  rate budget. Engines may take a few minutes to fully warm on a
-  fresh machine; the screen shows `starting` until the first candle
-  arrives. If the system is restarted frequently, pre-warm via
-  `freqtrade download-data --pairs BTC/USDC:USDC ETH/USDC:USDC SOL/USDC:USDC HYPE/USDC:USDC --timeframe 1m 3m 5m --days 90`.
+- **Live candles only**: Hyperliquid has no historical OHLCV endpoint
+  via ccxt, so the engines don't seed bulk history; they warm up from
+  the first 60 live ticks per slot. The first ~60 minutes of a slot's
+  ATR(14) + EMA(26) is therefore noisy. If a backtest or hyperopt is
+  needed, use a different exchange or fetch the candles via
+  `grid/screen.py:fetch_candles()` and feed them in directly.
 - **Strategy tuning was 1h-tuned** (band_atr 4.2, step_factor 1.0).
   The M5 pass invariants (taker-fee floor, entry filter, trend gate)
   are TF-agnostic, but the *band_atr* defaults were chosen for 1h

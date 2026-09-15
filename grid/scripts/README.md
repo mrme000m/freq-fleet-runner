@@ -12,7 +12,7 @@ wire into cron / monitoring.
 | `start_all.sh`   | Bring up the full stack (PB + console + 4 engines) | yes | writes PIDs, log files |
 | `stop_all.sh`    | Tear down the full stack (or a subset via `--keep-*`) | yes | kills PIDs |
 | `restart.sh`     | Stop, wait for ports to clear, start, wait for ping | yes | same as start/stop |
-| `prewarm_data.sh`| `freqtrade download-data` for 4 slot pairs × lower TFs | yes (additive) | writes feathers |
+| `prewarm_data.sh`| `freqtrade download-data` for the given exchange/pairs/TFs | yes | writes feathers |
 | `screen.sh`      | Run `grid/screen.py` and refresh `screen_cache.json` | yes (refresh) | rewrites cache |
 | `health.sh`      | Probe every component, candle-freshness check | yes (read-only) | none |
 
@@ -35,8 +35,9 @@ timestamped logging).
 ## Quick start
 
 ```sh
-# 1. (one-time per machine) pre-download candle history so the
-#    engines warm up instantly on first start:
+# 1. (one-time per machine) seed OHLCV history for backtests /
+#    hyperopt (skipped on Hyperliquid — live engines warm up from
+#    per-tick ccxt fetches; use a different exchange for backtests):
 ./grid/scripts/prewarm_data.sh
 
 # 2. start the full stack:
@@ -69,21 +70,29 @@ open http://127.0.0.1:8798/#fleet
 ## Prewarm
 
 ```sh
-# Default: 90 days × {1m, 3m, 5m, 15m} × 4 slot pairs
+# Default: 90 days × {1m, 3m, 5m, 15m} × 4 slot pairs.
+# Hyperliquid has no historical OHLCV endpoint via ccxt — the
+# script detects that and exits 0 with an explanation. The live
+# engines warm up from per-tick ccxt fetches, so no prewarm is
+# needed on Hyperliquid.
 ./grid/scripts/prewarm_data.sh
 
 # Longer history for re-hyperopt:
 ./grid/scripts/prewarm_data.sh --days 180
 
-# Custom TFs / pairs (useful for verifying the pipeline):
+# Custom TFs / pairs (useful for verifying the pipeline or for
+# backtests on exchanges that do support historical downloads,
+# e.g. Binance):
 ./grid/scripts/prewarm_data.sh --timeframes 1m 5m \
     --exchange binance --pairs BTC/USDT:USDT
 ```
 
-`prewarm_data.sh` is **additive** — it uses freqtrade's `--prepend`
-flag, so re-running it daily only fetches the missing tail. The script
-prints which feather files landed and exits non-zero if zero files
-were written.
+`prewarm_data.sh` uses freqtrade's `--prepend` flag when supported, so
+re-running it daily only fetches the missing tail. The script prints
+which feather files landed and exits non-zero only when an exchange
+that *should* support downloads (Binance, Bybit, OKX, …) wrote zero
+files. On Hyperliquid it always exits 0 — engines there run on live
+ticks only.
 
 ## Screen
 

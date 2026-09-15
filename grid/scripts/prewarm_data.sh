@@ -1,31 +1,32 @@
 #!/usr/bin/env bash
-# grid/scripts/prewarm_data.sh — pre-download candles for all 4 slots.
+# grid/scripts/prewarm_data.sh — pre-download OHLCV candles via freqtrade.
 #
-# Solves the slow first-boot problem documented in
-# grid/docs/reset-2026-09-15-lowertf.md: on a fresh tree the 4 engines
-# each pull 90 days of lower-TF candles from Hyperliquid on first
-# start, all from the shared HL rate budget. Running this script BEFORE
-# start_all.sh fills ft_user_data/data/ with the needed feather files
-# so the engines warm up instantly.
+# Best-effort history warm-up for backtests / hyperopt. On exchanges
+# that support it (Binance, Bybit, OKX, Kraken, …) this populates
+# ft_user_data/data/<exchange>/<market>/ with feather files so backtest
+# runs don't hit the exchange at every iteration.
 #
-# Defaults: 90 days, 1m + 3m + 5m + 15m candles, all 4 slot pairs,
-# futures-only (the swap perp grid never touches spot/funding rates).
-# Bump --days to 180 if your analysis needs longer lookback; the LLM
-# swarm still calls multi_tf_pack() with its bounded windows, but the
-# engines' startup_candle_count benefits from depth.
+# Hyperliquid note (2026-09-15 reset): the engines on Hyperliquid do NOT
+# need this script — freqtrade's `download-data` is rejected by the
+# ccxt Hyperliquid implementation ("Historic data not available for
+# Hyperliquid"). The live engines stream candles one bar at a time via
+# the per-tick ccxt `fetch_ohlcv` path, and the strategy warms up from
+# those live ticks (startup_candle_count=60 × slot TF). This script
+# detects that case and exits 0 with an explanation, so it can stay in
+# cron pipelines without generating noise.
 #
 # Usage:
-#   ./grid/scripts/prewarm_data.sh                   # 90d, 1m+3m+5m+15m
+#   ./grid/scripts/prewarm_data.sh                   # 4 slot pairs (HL)
 #   ./grid/scripts/prewarm_data.sh --days 180        # longer history
 #   ./grid/scripts/prewarm_data.sh --timeframes 1m 5m 15m
 #   ./grid/scripts/prewarm_data.sh --exchange binance --pairs BTC/USDT:USDT
-#       # ad-hoc smoke against any exchange; useful for verifying the
-#       # pipeline before pointing at the live slot pairs.
+#       # ad-hoc fetch against any supported exchange (useful for
+#       # verifying the pipeline or for backtests/hyperopt).
 #
 # Exit codes:
-#   0   all fetches finished; feathers present in ft_user_data/data/
-#   1   .venv-ft/bin/freqtrade missing or freqtrade invocation failed
-#   2   no feather files appeared after the run (silent fetch failure)
+#   0   all fetches finished (or skipped on purpose, e.g. Hyperliquid)
+#   1   .venv-ft/bin/freqtrade missing
+#   2   freqtrade invocation failed AND no feathers were written
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -79,13 +80,13 @@ TF_ARGS=()
 for tf in "${TIMEFRAMES[@]}"; do TF_ARGS+=("$tf"); done
 PAIR_ARGS=()
 for p in "${PAIRS[@]}"; do PAIR_ARGS+=("$p"); done
-
 CT_ARGS=()
 for ct in "${CANDLE_TYPES[@]}"; do CT_ARGS+=("$ct"); done
 
 # freqtrade exits non-zero if even one pair fails — we capture, log,
 # and continue so a single bad symbol doesn't abort the whole warm.
 log_info "running freqtrade download-data (this can take a few minutes)..."
+dl_log=/tmp/prewarm.log
 if ! "$FT_BIN" download-data \
     --userdir "$FT_USER_DATA" \
     --exchange "$EXCHANGE" \
@@ -94,7 +95,18 @@ if ! "$FT_BIN" download-data \
     --pairs "${PAIR_ARGS[@]}" \
     --timeframes "${TF_ARGS[@]}" \
     --days "$DAYS" \
-    --prepend 2>&1 | tee /tmp/prewarm.log; then
+    --prepend >"$dl_log" 2>&1; then
+  # Detect the "exchange doesn't support historical OHLCV" refusal
+  # pattern that Hyperliquid (and a few others) emit. This is NOT an
+  # error condition for the live engines — they fetch live ticks via
+  # ccxt on every candle close — so we exit cleanly rather than fail
+  # the script.
+  if grep -q 'does not support downloading trades or ohlcv data' "$dl_log"; then
+    log_warn "${EXCHANGE} has no historical OHLCV endpoint — engines will"
+    log_warn "  warm up from live ccxt ticks (startup_candle_count per slot)."
+    log_warn "  No prewarm needed. Exiting 0."
+    exit 0
+  fi
   log_warn "freqtrade download-data exited non-zero — checking what landed"
 fi
 
@@ -116,6 +128,6 @@ done
 
 log_info "prewarm complete: $landed/$total feather files present"
 if (( landed == 0 )); then
-  log_err "no feather files landed — investigate /tmp/prewarm.log"
+  log_err "no feather files landed — investigate $dl_log"
   exit 2
 fi
